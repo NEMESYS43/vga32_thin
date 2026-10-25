@@ -1,0 +1,6 @@
+numpy
+pillow
+psutil
+# Full web browser (the "Web" app). Uses the installed Edge or Chrome; if neither exists,
+# run `python -m playwright install chromium` once.
+playwright

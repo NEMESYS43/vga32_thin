@@ -1,0 +1,6 @@
+secrets.h
+__pycache__/
+*.pyc
+.claude/
+.vscode/
+build/
