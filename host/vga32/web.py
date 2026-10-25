@@ -128,9 +128,11 @@ class WebUI:
                         since = -1
                     png, ver, size, conn = web.wait_frame(since, timeout=15)
                     if png is None:
-                        self._send(204, "text/plain", b"", [("X-Version", str(ver)), ("X-Connected", str(int(conn)))])
+                        self._send(204, "text/plain", b"", [("X-Version", str(ver)), ("X-Connected", str(int(conn)))]
+                                   + web.grab_headers())
                     else:
                         self._send(200, "image/png", png, [("X-Version", str(ver)), ("X-Connected", str(int(conn))),
+                                                           *web.grab_headers(),
                                                            ("X-Size", f"{size[0]}x{size[1]}")])
                 elif u.path == "/api" or u.path == "/api/":
                     self._json(200, {"tools": [{k: t[k] for k in ("name", "description", "inputSchema")}
@@ -222,6 +224,13 @@ class WebUI:
             self.version += 1
             self._cond.notify_all()
 
+    def grab_headers(self):
+        try:
+            zones = ";".join(",".join(str(int(v)) for v in z) for z in self.desk.grab_zones())
+        except Exception:          # windows changing under us on the desktop thread; next frame has it
+            zones = ""
+        return [("X-Grab", str(int(self.desk.grab is not None))), ("X-Grab-Zones", zones)]
+
     def wait_frame(self, since, timeout):
         with self._cond:
             self._cond.wait_for(lambda: self.version != since, timeout)
@@ -233,7 +242,10 @@ class WebUI:
         q = self.desk.inbox
         for e in events:
             if e["t"] == "mouse":
-                q.put(Mouse(int(e["x"]), int(e["y"]), int(e["b"]) & 7, int(e.get("w", 0)), web=True))
+                if e.get("rel"):
+                    q.put(Mouse(int(e["dx"]), int(e["dy"]), int(e["b"]) & 7, int(e.get("w", 0)), web=True, rel=True))
+                else:
+                    q.put(Mouse(int(e["x"]), int(e["y"]), int(e["b"]) & 7, int(e.get("w", 0)), web=True))
             elif e["t"] == "key":
                 q.put(Key(str(e["name"]), str(e.get("char", ""))[:1], bool(e["down"]), int(e.get("mods", 0)) & 255))
 
@@ -295,6 +307,8 @@ async function pump(){
     try{
       const r = await fetch(`/frame?v=${ver}&key=${encodeURIComponent(KEY)}`, {cache:"no-store"});
       connected = r.headers.get("X-Connected") === "1";
+      grabZones = (r.headers.get("X-Grab-Zones") || "").split(";").filter(Boolean).map(z => z.split(",").map(Number));
+      setGrab(r.headers.get("X-Grab") === "1");
       if(r.status === 200){
         ver = +r.headers.get("X-Version");
         const [w,h] = r.headers.get("X-Size").split("x").map(Number);
@@ -333,10 +347,62 @@ function pos(e){
   my = Math.max(0, Math.min(cv.height - 1, Math.floor((e.clientY - r.top) * cv.height / r.height)));
 }
 const mouseEv = (w=0) => ({t:"mouse", x:mx, y:my, b:buttons, w});
-cv.addEventListener("pointerdown", e => { cv.focus(); cv.setPointerCapture(e.pointerId); pos(e); buttons = e.buttons & 7; send(mouseEv()); e.preventDefault(); });
-cv.addEventListener("pointerup", e => { pos(e); buttons = e.buttons & 7; send(mouseEv()); });
-cv.addEventListener("pointermove", e => { pos(e); buttons = e.buttons & 7; pendingMove = mouseEv(); flush(); });
-cv.addEventListener("wheel", e => { pos(e); send(mouseEv(e.deltaY < 0 ? 1 : -1)); e.preventDefault(); }, {passive:false});
+// When an app captures the mouse (3D / mouse-look), the page uses pointer lock and sends relative motion.
+let grab = false, relX = 0, relY = 0, grabZones = [], lockedAt = 0;
+const locked = () => document.pointerLockElement === cv;
+const inZone = (x, y) => grabZones.some(([zx, zy, zw, zh]) => x >= zx && y >= zy && x < zx + zw && y < zy + zh);
+function setGrab(g){
+  // Not captured on the desktop but still locked here (e.g. a click on a game window the desktop
+  // didn't grab for): let go, after giving the desktop a moment to catch up with the click.
+  if(!g && locked() && performance.now() - lockedAt > 800) document.exitPointerLock();
+  if(g === grab) return;
+  grab = g;
+  hint.textContent = g ? "Click the screen to capture the mouse (Esc releases)" : "Click the screen to control it";
+  if(g && !locked()) hint.classList.remove("hide");
+}
+document.addEventListener("pointerlockchange", () => {
+  if(locked()){ hint.classList.add("hide"); return; }
+  if(grab){   // the browser took Esc to leave pointer lock; pass it on so the app releases too
+    send({t:"key", name:"ESCAPE", char:"", down:true, mods:0}); send({t:"key", name:"ESCAPE", char:"", down:false, mods:0});
+  }
+});
+function relFlush(){
+  const dx = Math.trunc(relX), dy = Math.trunc(relY);   // keep the fractions for next time
+  if(!dx && !dy) return;
+  relX -= dx; relY -= dy;
+  if(pendingMove && pendingMove.rel && pendingMove.b === buttons){ pendingMove.dx += dx; pendingMove.dy += dy; }
+  else { if(pendingMove) queue.push(pendingMove); pendingMove = {t:"mouse", rel:1, dx, dy, b:buttons}; }
+  flush();
+}
+cv.addEventListener("pointerdown", e => {
+  cv.focus();
+  if(!locked() && (grab || (e.button === 0 && (pos(e), inZone(mx, my))))){
+    // Lock now, inside the click: browsers only allow pointer lock during a user gesture.
+    lockedAt = performance.now();
+    try{ cv.requestPointerLock(); }catch(err){}
+  }
+  if(locked()){ buttons = e.buttons & 7; send({t:"mouse", rel:1, dx:0, dy:0, b:buttons}); e.preventDefault(); return; }
+  cv.setPointerCapture(e.pointerId); pos(e); buttons = e.buttons & 7; send(mouseEv()); e.preventDefault();
+});
+cv.addEventListener("pointerup", e => {
+  buttons = e.buttons & 7;
+  if(locked()){ relFlush(); send({t:"mouse", rel:1, dx:0, dy:0, b:buttons}); return; }
+  pos(e); send(mouseEv());
+});
+cv.addEventListener("pointermove", e => {
+  buttons = e.buttons & 7;
+  if(locked()){
+    const r = cv.getBoundingClientRect();
+    relX += e.movementX * cv.width / r.width; relY += e.movementY * cv.height / r.height;
+    relFlush(); return;
+  }
+  pos(e); pendingMove = mouseEv(); flush();
+});
+cv.addEventListener("wheel", e => {
+  const w = e.deltaY < 0 ? 1 : -1;
+  if(locked()) send({t:"mouse", rel:1, dx:0, dy:0, b:buttons, w}); else { pos(e); send(mouseEv(w)); }
+  e.preventDefault();
+}, {passive:false});
 cv.addEventListener("contextmenu", e => e.preventDefault());
 cv.addEventListener("focus", () => hint.classList.add("hide"));
 cv.addEventListener("blur", () => hint.classList.remove("hide"));

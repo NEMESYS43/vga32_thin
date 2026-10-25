@@ -22,8 +22,10 @@ DEFAULTS = {
         "icons": True,                  # show desktop icons
     },
     "clock_24h": True,
+    "adaptive_palette": True,           # 3D / media apps that ask for it get the best 16 of 64 colors while focused
     "icons": {},                        # app id -> [x, y] desktop icon position
     "hidden_apps": [],                  # app ids left out of menus and the desktop
+    "dock": ["files", "web", "terminal", "notes", "assistant", "settings"],    # Aqua Dock, left to right
     "assistant": {
         "url": "http://127.0.0.1:11434/v1",     # any OpenAI-compatible endpoint (Ollama, llama.cpp, LM Studio)
         "model": "llama3.1",

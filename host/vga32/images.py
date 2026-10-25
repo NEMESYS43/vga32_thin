@@ -80,8 +80,5 @@ def to_palette(im, use_dither=True):
     """RGB image -> RGB image that uses only palette colors."""
     if use_dither:
         return dither(im)
-    from .palette import PALETTE
-    pal = Image.new("P", (1, 1))
-    flat = [c for rgb in PALETTE for c in rgb]
-    pal.putpalette(flat + flat[:3] * (256 - len(PALETTE)))
-    return im.quantize(palette=pal, dither=Image.Dither.NONE).convert("RGB")
+    from .palette import active
+    return im.quantize(palette=active().pal_image(), dither=Image.Dither.NONE).convert("RGB")

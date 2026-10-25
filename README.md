@@ -46,6 +46,7 @@ Use `--no-board` to run with only the web remote, for example to develop agent w
 | Resize a window | Drag its bottom-right corner |
 | Maximize / restore | The zoom button, or double-click the title bar (Classic) |
 | Roll up (windowshade) | The shade button, or double-click the title bar (Platinum) |
+| Minimize | The yellow button (Aqua), double-click the title (Aqua), clicking the focused window's taskbar button (Classic), or the window menu |
 | Always on top | Right-click the title bar |
 | Close a window | The X / close box or Alt+F4 |
 | Switch windows | Taskbar buttons, the Window menu, the app switcher (Platinum, top right) or Alt+Tab |
@@ -56,7 +57,13 @@ Use `--no-board` to run with only the web remote, for example to develop agent w
 
 **Settings** (or right-click the desktop > Desktop Settings) changes the following:
 
-- **Theme**: Classic has a taskbar and Start menu. **Platinum** is in the style of Mac OS 9: a menu bar across the top (◆ system menu, File / Edit / app menus / Window, clock, app switcher), pinstriped title bars with a close box on the left and zoom and windowshade boxes on the right, grow box, black arrow cursor and a lavender highlight.
+- **Theme**: Classic has a taskbar and Start menu. **Aqua** is in the style of early Mac OS X:
+  - a white pinstriped menu bar with a blue orb menu, the bold app name (About / Hide / Hide Others / Quit), app menus, the clock and a search menu that lists every app;
+  - windows with red/yellow/green traffic-light buttons that show x - + under the pointer, soft shadows and rounded corners;
+  - blue gel buttons, checkboxes, sliders and striped progress bars;
+  - a procedurally drawn blue "swoosh" wallpaper;
+  - a **Dock** with magnification, labels, running-app triangles and minimized windows. Right-click a Dock icon for Keep in Dock or Quit.
+- **Platinum** is in the style of Mac OS 9: a menu bar across the top (◆ system menu, File / Edit / app menus / Window, clock, app switcher), pinstriped title bars with a close box on the left and zoom and windowshade boxes on the right, grow box, black arrow cursor and a lavender highlight.
   - The board's DAC is RGB222, so Platinum's light grey is the 170 grey. Its palette and cursor are sent to the board when the theme is applied; no reflash is needed.
   - Drop a `.ttf` into `~/.vga32/fonts` to use it for Platinum title bars and menus (for example a Chicago-style bitmap font you have a license for). Otherwise DejaVu/Arial Bold is used.
 - **Desktop**: background color, pattern, caption, desktop icons, and a **wallpaper** (image path or URL; fill, fit, center or tile, dithered onto the palette).
@@ -76,6 +83,7 @@ Apps:
 - **Clock**
 - **System**: CPU and RAM (needs psutil).
 - **Files**: browse the PC's folders. Double-click opens folders, images (viewer), text files (Notes) and HTML (Web). Right-click: Copy Path, Use as Wallpaper, Open Terminal Here.
+- **3D Viewer**: walk through Quake 1 maps (`.bsp`) and look at `.obj` models on the GPU (see [3D](#3d)). Files opens these files in it.
 - **Assistant**: a chat window backed by a **local model** (Ollama, llama.cpp, LM Studio, or any OpenAI-compatible endpoint; set it in Settings > Agents). The model gets the same tools as external agents, so it can open apps, run commands and build panels on this desktop.
 - **Settings**: see above.
 - **Panel**: windows that agents design (dashboards, forms, menus, status boards). These are created through the API.
@@ -210,21 +218,24 @@ If Hermes runs in WSL or on another machine, use the PC's LAN address, not `127.
 | `screenshot` | PNG of what the monitor shows; optional `window_id` crop and `scale` 1–3 |
 | `open_app` | Open any app by id (built-ins, plugins, registered apps) at an optional position and size, with options (`url`, `path`, `text`, `command`, `page`, panel `elements`) |
 | `list_apps`, `register_app`, `unregister_app` | The app registry: declare apps that show up in the menus and on the desktop |
+| `install_app`, `app_source` | Install, update or read a Python app that runs on the desktop (games, real-time apps); needs the `admin` scope |
 | `wait_events` | Wait for desktop events after a `seq`, filtered by type prefix, app or window |
 | `ask_user` | Message, confirm, text input or choice dialog on the VGA screen; returns the answer |
 | `show_menu` | Pop up a menu and return the item the user picked |
 | `clipboard`, `hotkey` | The shared clipboard; global shortcuts that send `hotkey` events |
 | `settings` | Read or change persistent settings |
+| `view3d` | Drive the 3D Viewer: open a map or model, read its state, place the camera (Quake or viewer coordinates), walk with collision, switch walk / noclip, set exposure, and take full-colour screenshots |
 | `local_ai` | Ask the local model (the Assistant's endpoint) a question and get text back |
-| `window` | focus, close, move, resize, set_geometry, maximize, restore, shade, unshade, on_top, not_on_top |
+| `window` | focus, close, move, resize, set_geometry, maximize, restore, shade, unshade, minimize, unminimize, on_top, not_on_top |
+| `ui` | Read, set, click or focus the native widgets of any widget app or panel |
 | `layout` | cascade, tile, rows, grid, main-left, main-top, maximize, for all windows or a chosen list, with an optional gap |
-| `type_text`, `press_key`, `mouse` | Raw input: text, key combos (`ctrl+s`, `alt+tab`, `win`), click / double-click / drag / scroll, optionally relative to a window |
+| `type_text`, `press_key`, `mouse` | Raw input: text, key combos (`ctrl+s`, `alt+tab`, `win`), click / double-click / drag / scroll, optionally relative to a window, and `look` (relative motion for captured-mouse apps) |
 | `terminal` | Run a command and get its output and exit code, read recent output, or kill a command |
 | `web` | The full browser: navigate, back, forward, reload, read (text, links, form controls, videos), eval (run JavaScript), click (CSS selector or x/y), type, press, scroll, wait_for, screenshot (full-color PNG of the page), dither |
 | `browser` | The text browser: navigate (URL or search words), back, forward, reload, read (text + numbered links and images), read_visible, click_link, scroll, find |
 | `image` | Open an image in the viewer (URL, file or folder on the PC, data URI), step next/prev in its folder, set dither and fit |
 | `notes` | Read, write or append the notes text |
-| `panel` | Create or update a custom window from elements: text, rect, ellipse, line, bar, chart, list, table, button, image, input, checkbox, plus a right-click `menu` and `menubar` menus |
+| `panel` | Create or update a custom window from elements: text, rect, ellipse, line, bar, chart, list, table, image, plus native widgets (button, input, checkbox, radio, slider, select, listbox, progress), a right-click `menu` and `menubar` menus |
 | `panel_events` | Button clicks and key presses on one panel (older polling API; `wait_events` covers every window) |
 | `paint` | Draw the same elements onto a Paint canvas |
 | `notify` | Toast message in the top-right corner |
@@ -273,6 +284,7 @@ Other options:
 - `"kind": "command"` with a `command` runs it in a Terminal.
 - `"webhook"` POSTs the app's events to a URL, so the agent doesn't have to stay connected.
 - `persist: true` saves the manifest to `~/.vga32/apps/<id>.json`. You can also write that file by hand.
+- A persistent panel app also remembers what the agent last drew (in `~/.vga32/apps/state/`). After it's closed, or after a restart, it reopens looking the same even if the agent is offline. Its `app.launched` event then has `restored: true`.
 
 ### 2. A Python plugin
 
@@ -301,6 +313,174 @@ class Hello(App):
 ```
 
 Plugins that fail to load are listed in `get_state` under `plugin_errors` and in Settings > Apps.
+
+### Games and other real-time apps
+
+Relaying every keypress through an agent is far too slow for a game. Instead, the agent writes the game in Python and installs it with `install_app`. The game then runs on the desktop at its own frame rate.
+
+```python
+from vga32.game import GameApp
+
+class Snake(GameApp):
+    app_id = "games.snake"
+    title = "Snake"
+    category = "Games"
+    width, height = 160, 100      # logical pixels, scaled up to fit the window
+    fps = 30
+
+    def start(self):
+        self.x, self.y = 80, 50
+
+    def update(self, dt):
+        if self.held("left"):
+            self.x -= 1
+        if self.pressed("space"):
+            self.score += 1
+
+    def render(self, g):
+        g.clear("navy")
+        g.rect(self.x, self.y, 4, 4, "lime")
+        g.sprite([".r.", "rrr", ".r."], 20, 20, scale=2)
+        g.text(2, 2, f"score {self.score}")
+
+    def game_state(self):         # what agents see in get_state
+        return {"x": self.x}
+```
+
+**Input**
+
+- `held(k)` is true while a key is down. `pressed(k)` and `released(k)` are true only on the update where the key changed.
+- Key names are lowercase: `left`, `space`, `a`, `f1`...
+- The mouse is in `self.pointer`, and `clicked(1)` reports clicks.
+
+**Drawing**
+
+- `g` provides `clear`, `rect`, `frame`, `circle`, `line`, `poly`, `pixel`, `text` and `sprite`.
+- Sprites are ASCII art. Letters stand for palette colors, for example `r` red and `l` lime.
+
+**Running and errors**
+
+- Games pause while their window isn't focused.
+- If the game raises an error, its window shows the traceback and F5 retries. The error is also sent back to the agent in the `install_app` result and as an `app.error` event, so it can fix the code and reinstall.
+
+Installed apps are saved to `~/.vga32/apps/<name>.py`, so they stay in the menu after a restart. Reinstalling replaces any running copy.
+
+**Mouse capture for 3D:** set `mouse_look = True`.
+
+- Clicking the game hides the cursor and sends relative motion. Read it each update with `self.mouse_delta()`. Esc releases the mouse.
+- With firmware protocol 2 (this sketch), the board switches to a relative mouse mode: it sends raw movement with no acceleration and no screen edges. Reflash the board to get it.
+- Older firmware still works. The desktop keeps recentering the hidden pointer instead, which is less smooth on fast flicks.
+- From the web remote, clicking a mouse-look window locks the browser's pointer on the first click.
+- When the mouse is released, the pointer reappears in the middle of the window.
+- Any `App` can do the same with `self.grab_mouse()` and `mouse_motion(dx, dy)`.
+
+**3D:** there are two levels.
+
+- **`vga32.gl3d`** is a GPU engine (OpenGL 3.3 through `moderngl`, which runs headless on Linux through EGL). It renders off-screen into the game's canvas, and you dither it with `g.dither()`. It provides:
+  - tens of thousands of textured triangles with a depth buffer;
+  - lightmaps, a sun, ambient light and up to 8 point lights;
+  - fog, gradient or cube-map skyboxes, animated water, alpha-tested cut-outs and scrolling textures;
+  - exposure and gamma, plus auto-exposure, so dark scenes stay readable in 16 colours.
+
+  On the development PC (Radeon RX 7900 XTX), a 65,000-triangle Quake map renders in about 4–8 ms per frame.
+- **`vga32.quake`** loads Quake 1 maps (BSP29, BSP2, 2PSB):
+  - textures, with `.lit` coloured lightmaps packed into one atlas;
+  - entities and the player spawn;
+  - skyboxes from `gfx/env`;
+  - Quake-style walking against the map's player collision hull (gravity, jumping, stairs, sliding along walls), or noclip flying.
+
+  Textures need Quake's palette (`gfx/palette.lmp`). It's found next to the map, in `id1/` or inside `pak0.pak`, or you can set `QUAKE_DIR` to your Quake folder. Without it, textures show in grey.
+- The **3D Viewer** app ties these together. Controls:
+  - WASD moves, the mouse looks, Space jumps, F toggles walk/noclip.
+  - Tab jumps to the next spawn point.
+  - `[` and `]` change brightness, `-` and `=` change the field of view.
+  - Ctrl+O opens a file.
+
+  Agents drive it with `view3d`.
+- **Adaptive palette:** while a window whose app sets `adaptive_palette = True` (the 3D Viewer and the 3D examples) is focused, the desktop picks the 16 of the board's 64 colours that best fit what the app renders and switches the board's palette.
+  - Black and white stay fixed because the cursor uses them.
+  - Everything else on screen is mapped to the nearest of those colours while that window is in front, and the normal palette returns when focus moves on.
+  - A switch resends the whole screen once, so the palette only changes when the new one is clearly better.
+  - Turn it off with `"adaptive_palette": false` in settings, or press `P` in the viewer.
+- Set `pixel = 2` on a `GameApp` and its canvas follows the window size at chunky 2×2 pixels. `overlay(g)` draws crisp HUD text at screen resolution.
+
+`vga32.render3d` has two software engines that need no GPU. Both draw full colour; call `g.dither()` once per frame to spread the shading over the 16 colours.
+
+- `Scene` / `Mesh` / `Camera` draw polygon worlds:
+  - meshes: cube, box, grid floors, sphere, cylinder, pyramid, or your own `.obj` files;
+  - lighting, fog and a sky gradient;
+  - mouse-look and walk/fly cameras.
+  - A few hundred faces render in about 20 ms at 200x125.
+- `Raycaster` draws Wolfenstein/Doom-style grid levels with wall collision, fog and billboard sprites. It takes under 2 ms per frame.
+
+Examples to copy into `~/.vga32/apps/` (or send through `install_app`) are in [examples/apps/](examples/apps/):
+
+- `maze3d.py`: a first-person maze with mouse-look.
+- `cubes3d.py`: a polygon playground.
+- `widget_gallery.py`: every native widget, on tabs.
+- `mesh_editor.py`: a polygon modeller (UI + 3D view + editable mesh + agent commands).
+
+Smooth play depends on how much of the screen changes. Small sprites on a static background run at full speed. Redrawing the whole screen every frame is limited by the board link, at about 600 KB/s.
+
+### Native widgets
+
+`vga32.widgets` is a theme-aware UI toolkit. Subclass `UIApp` and return a tree from `build()`.
+
+- Layout: `Column`, `Row` (with `flex` sizing), `Group`, `TabView`, `ScrollView`, `Spacer`, `Separator`.
+- Content: `Label`, `ProgressBar`, `ImageView`, `CanvasView` (custom drawing and mouse).
+- Controls: `Button`, `MenuButton`, `Checkbox`, `Switch`, `Radio`, `Slider`, `NumberField`, `TextField`, `TextArea`, `ListBox`, `Table` (sortable columns), `TreeView`, `Dropdown`, `ColorPicker`.
+- Dialogs: `self.desk.file_dialog("open" | "save" | "folder", callback, filter=(".txt",))` and `self.desk.dialog(kind=..., text=..., on_result=fn)`.
+
+How it behaves:
+
+- Tab moves focus, Enter presses the default button, and the mouse wheel scrolls whatever scrollable widget is under the pointer.
+- Every widget restyles itself for Classic, Platinum and Aqua.
+- `find(id)`, `values()` and the `on_change` / `on_click` / `on_submit` hooks give you each widget's state.
+- Changes are also published as `ui.change` / `ui.click` / `ui.submit` events.
+- Agents can drive any widget with the `ui` tool.
+
+Agent panels use the same widgets for their interactive elements. Panels also get `textarea`, `number`, `switch` and `color` elements.
+
+**App assets:** `install_app` accepts an `assets` object. It maps file names to base64 data, `"text:..."`, or URLs to download, and stores them in `~/.vga32/apps/<name>/`. Inside the app, `from vga32.registry import assets_dir; ASSETS = assets_dir(__file__)`.
+
+### Building advanced apps (for agents)
+
+Agents should call **`dev_docs`** first, starting with the `overview` topic. The same docs are MCP resources at `vga32://docs/<topic>`. They're generated from the code, so they match the version that's running.
+
+**Tools for building and debugging apps:**
+
+| Tool | Use |
+|---|---|
+| `install_app` | Install or update an app from source, with optional `assets` |
+| `app_call` | Call a running app's `cmd_<name>` methods (`commands` lists them, `state` returns its state) |
+| `app_eval` | Run Python inside a running app to inspect or patch it (admin scope) |
+| `app_logs` | The app's `self.log(...)` lines, plus tracebacks of crashes in its drawing, input, ticks and commands |
+| `app_data` | The app's saved storage (`self.storage` / `self.save_storage()`) |
+| `wait_events` | Events the app publishes with `self.emit("name", ...)` (as `app.name`) |
+
+A crash in an app's input handler, drawing or tick is logged and shown. It never takes the desktop down.
+
+**3D stack:**
+
+- **`vga32.gl3d`**, the GPU engine:
+  - scene graph: parent/child nodes, find by name, world bounds;
+  - meshes that update every frame, indexed meshes, and triangles, lines or points;
+  - built-in grids, axes, wireframes and bounding boxes;
+  - materials with transparency, culling, wireframe and depth offset;
+  - **custom GLSL shaders** and raw-OpenGL `on_draw` hooks;
+  - lights, fog and skyboxes;
+  - **GPU picking** (node, triangle and 3D point under a pixel), plus screen-to-world rays and world-to-screen projection;
+  - orthographic and orbit cameras.
+- **`vga32.mesh.EditableMesh`**: polygon modelling with primitives, extrude, inset, subdivide, smooth, mirror, weld, delete, raycast, undo/redo and OBJ in and out.
+- **`vga32.formats.load_model`**: glTF 2.0 / GLB (textures, node hierarchy) and OBJ with MTL materials.
+- **`vga32.widgets.Viewport3D`**: a live 3D view inside any widget layout. Right-drag orbits, middle-drag pans, the wheel zooms, and it has `on_pick` / `on_drag` callbacks.
+
+`examples/apps/mesh_editor.py` is a complete modeller built only from these public APIs:
+
+- Click faces or vertices to select them, and drag to move them.
+- Extrude, inset, subdivide, smooth, colour, delete, and undo/redo.
+- Open and save OBJ files; the model is kept between sessions.
+- Agents can drive every operation through `app_call`, for example `add`, `select`, `extrude` or `set_mesh` with their own procedural geometry.
 
 ### 3. A built-in
 

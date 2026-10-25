@@ -4,3 +4,5 @@ psutil
 # Full web browser (the "Web" app). Uses the installed Edge or Chrome; if neither exists,
 # run `python -m playwright install chromium` once.
 playwright
+# GPU 3D engine (vga32.gl3d, the 3D Viewer and Quake maps). Optional; needs an OpenGL 3.3 driver.
+moderngl

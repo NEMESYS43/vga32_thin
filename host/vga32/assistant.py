@@ -9,7 +9,7 @@ import threading
 import urllib.request
 
 from .palette import C
-from .panel import _wrap
+from .ui import wrap_text as _wrap
 from .ui import CH, FONT, App
 
 MAX_ROUNDS = 8

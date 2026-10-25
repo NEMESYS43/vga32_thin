@@ -27,7 +27,7 @@ constexpr int W=640,H=480;
 #define TC_VIDEO_MODE VGA_640x480_60Hz
 #endif
 
-constexpr uint8_t PROTO_VERSION=1;
+constexpr uint8_t PROTO_VERSION=2;   // 2: relative mouse mode (OP_CURSOR 3, EV_MOUSE_REL)
 constexpr uint16_t TCP_PORT=7777, BEACON_PORT=7778;
 constexpr uint16_t MAX_BODY=4200;
 constexpr int CUR_MAX=32;
@@ -51,6 +51,7 @@ enum : uint8_t {
   OP_LINE=0x08,    // x1 y1 x2 y2 i16, color
   OP_RECT=0x09,    // x y w h i16, color (outline)
   OP_CURSOR=0x0A,  // 0 hidden | 1 arrow | 2 w h hx hy + w*h pixels (255 = transparent)
+                   // | 3 relative: hidden, the pointer stays put and motion goes out as EV_MOUSE_REL
   OP_WARP=0x0B,    // x y u16
   OP_SYNC=0x0C,    // token u32, answered once everything before it is on screen
   OP_PING=0x0D,
@@ -64,6 +65,7 @@ enum : uint8_t {
   EV_SYNC=0x84,    // token u32
   EV_PONG=0x85,
   EV_ERROR=0x86,   // code, op
+  EV_MOUSE_REL=0x87, // dx i16, dy i16, buttons, wheel i8  (relative mode only)
 };
 enum : uint8_t {ERR_AUTH=1,ERR_BAD_OP=2,ERR_BAD_ARGS=3,ERR_TOO_BIG=4};
 
@@ -164,6 +166,8 @@ void guard(int x,int y,int w,int h){
 
 // ================= INPUT =================
 int mouseX=W/2,mouseY=H/2,mouseWheel=0;
+bool relMode=false;     // relative mouse (mouse-look): raw deltas to the host, no local pointer
+int relDX=0,relDY=0;
 uint8_t mouseButtons=0;
 bool mouseDirty=false;
 uint32_t mouseSentAt=0;
@@ -195,7 +199,7 @@ void drawStatus();
 void closePeer(){
   if(peer)peer.stop();
   authed=false;hdrHave=0;bodyHave=0;bodyWant=0;outLen=0;
-  cursorHide();defaultPalette();cursorArrow();cur.enabled=true;statusDirty=true;
+  cursorHide();defaultPalette();cursorArrow();cur.enabled=true;relMode=false;relDX=relDY=0;statusDirty=true;
   Serial.println("[NET] host disconnected");
 }
 void sendHello(){
@@ -279,7 +283,9 @@ void execute(){
     case OP_CURSOR:
       if(n<1){emitError(ERR_BAD_ARGS);break;}
       cursorHide();
+      relMode=false;
       if(p[0]==0)cur.enabled=false;
+      else if(p[0]==3){cur.enabled=false;relMode=true;relDX=relDY=0;}
       else if(p[0]==1){cursorArrow();cur.enabled=true;}
       else if(p[0]==2&&n>=5){int w=p[1],h=p[2];
         if(w<1||h<1||w>CUR_MAX||h>CUR_MAX||n!=5+w*h){emitError(ERR_BAD_ARGS);break;}
@@ -355,6 +361,13 @@ void pollMouse(){
   fabgl::MouseDelta d;
   while(m->deltaAvailable()&&m->getNextDelta(&d,0)){
     int dx=d.deltaX,dy=-d.deltaY;
+    if(relMode){        // raw motion for mouse-look: no acceleration, no screen edges
+      uint8_t nb=d.buttons.left|(d.buttons.right<<1)|(d.buttons.middle<<2);
+      relDX+=dx;relDY+=dy;mouseWheel+=d.deltaZ;
+      if(nb!=mouseButtons){mouseButtons=nb;mouseSentAt=0;mouseDirty=true;}  // buttons go out immediately
+      if(dx||dy||d.deltaZ)mouseDirty=true;
+      continue;
+    }
     // Mild acceleration: precise when slow, crosses 640px quickly when fast.
     if(abs(dx)>6)dx=dx*3/2; if(abs(dy)>6)dy=dy*3/2;
     int nx=constrain(mouseX+dx,0,W-1),ny=constrain(mouseY+dy,0,H-1);
@@ -371,7 +384,14 @@ void pollMouse(){
 }
 void sendMouse(){
   if(!mouseDirty||!authed)return;
-  if(millis()-mouseSentAt<8&&!mouseWheel)return;  // coalesce motion to ~125Hz
+  if(millis()-mouseSentAt<8&&!mouseWheel&&mouseSentAt)return;  // coalesce motion to ~125Hz
+  if(relMode){
+    int dx=constrain(relDX,-32768,32767),dy=constrain(relDY,-32768,32767);
+    uint8_t b[6]={(uint8_t)(dx&255),(uint8_t)((dx>>8)&255),(uint8_t)(dy&255),(uint8_t)((dy>>8)&255),
+      mouseButtons,(uint8_t)(int8_t)constrain(mouseWheel,-127,127)};
+    emit(EV_MOUSE_REL,b,6);relDX=relDY=0;mouseWheel=0;mouseDirty=false;mouseSentAt=millis();
+    return;
+  }
   uint8_t b[6]={(uint8_t)(mouseX&255),(uint8_t)(mouseX>>8),(uint8_t)(mouseY&255),(uint8_t)(mouseY>>8),
     mouseButtons,(uint8_t)(int8_t)constrain(mouseWheel,-127,127)};
   emit(EV_MOUSE,b,6);mouseWheel=0;mouseDirty=false;mouseSentAt=millis();

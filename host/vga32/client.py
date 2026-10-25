@@ -20,7 +20,7 @@ MAX_BODY = 4200
 
 OP_HELLO, OP_PALETTE, OP_FILL, OP_BLIT4, OP_BLITRLE, OP_COPY, OP_TEXT = range(1, 8)
 OP_LINE, OP_RECT, OP_CURSOR, OP_WARP, OP_SYNC, OP_PING, OP_CLEAR = range(8, 15)
-EV_HELLO, EV_KEY, EV_MOUSE, EV_SYNC, EV_PONG, EV_ERROR = range(0x81, 0x87)
+EV_HELLO, EV_KEY, EV_MOUSE, EV_SYNC, EV_PONG, EV_ERROR, EV_MOUSE_REL = range(0x81, 0x88)
 ERRORS = {1: "auth", 2: "bad op", 3: "bad args", 4: "too big"}
 
 # Modifier bits in EV_KEY.
@@ -68,6 +68,7 @@ class Mouse:
     buttons: int   # 1 left, 2 right, 4 middle
     wheel: int
     web: bool = False   # came from the browser UI, not the PS/2 mouse
+    rel: bool = False   # x, y are a relative motion (browser pointer lock), not a position
 
 
 class Disconnected(Exception):
@@ -173,6 +174,9 @@ class Device:
             self.events.put(Key(name, ch, bool(b[2]), b[4]))
         elif ev == EV_MOUSE:
             self.events.put(Mouse(b[0] | b[1] << 8, b[2] | b[3] << 8, b[4], struct.unpack("<b", b[5:6])[0]))
+        elif ev == EV_MOUSE_REL:
+            dx, dy, buttons, wheel = struct.unpack("<hhBb", b[:6])
+            self.events.put(Mouse(dx, dy, buttons, wheel, rel=True))
         elif ev == EV_SYNC:
             with self._sync_cond:
                 self._sync_acked = struct.unpack("<I", b)[0]
@@ -260,6 +264,15 @@ class Device:
         """pixels: list of rows of palette indices, 255 = transparent (max 32x32)."""
         h, w = len(pixels), len(pixels[0])
         self._send(OP_CURSOR, bytes((2, w, h, hx, hy)) + bytes(v for r in pixels for v in r))
+
+    @property
+    def relative_mouse(self):
+        """True if the firmware has the relative mouse mode (protocol 2+)."""
+        return self.info.proto >= 2
+
+    def cursor_relative(self):
+        """Hide the pointer and report raw motion (EV_MOUSE_REL) until another cursor op."""
+        self._send(OP_CURSOR, b"\x03")
 
     def warp(self, x, y):
         self._send(OP_WARP, struct.pack("<HH", x, y))

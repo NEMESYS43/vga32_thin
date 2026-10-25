@@ -6,6 +6,7 @@ so agent actions interleave safely with keyboard, mouse and browser input.
 import base64
 import io
 import json
+import os
 import time
 
 from PIL import Image
@@ -38,7 +39,20 @@ puts it in the Start/system menu (and on the desktop with desktop: true). When t
 get an app.launched event with its window_id; draw it with panel (window_id) and react to the user
 with wait_events (types ["panel.", "menu.select"], app_id). Panels support buttons, text inputs,
 checkboxes, a right-click "menu" and "menubar" menus. ask_user shows a dialog and returns the answer.
-Every event carries a seq; pass the last seq you saw as since so nothing is missed."""
+Every event carries a seq; pass the last seq you saw as since so nothing is missed.
+Persistent panel apps reopen with whatever you last drew (app.launched has restored: true).
+
+Building apps: read dev_docs (topic overview first). Apps are Python classes installed with install_app;
+drive them with app_call (their cmd_ methods), inspect them live with app_eval, read crashes with
+app_logs, and keep data with self.storage / app_data.
+
+Games and anything real-time: don't relay keys through yourself - write a Python app with install_app
+(subclass vga32.game.GameApp). It runs on the desktop at its own fps with held/pressed keys and
+mouse-look, can use the 3D engines in vga32.render3d, stays installed, and reports errors back so you
+can fix and reinstall. There is a GPU 3D engine (vga32.gl3d) and a Quake 1 map loader (vga32.quake); the
+built-in 3D Viewer (open_app viewer3d with path, or the view3d tool) walks through .bsp maps and shows
+.obj models. Native UI apps subclass vga32.widgets.UIApp. Check them with screenshot /
+get_state, and drive their widgets with the ui tool."""
 
 
 READ_JS = """(max) => {
@@ -151,7 +165,8 @@ def _parse_combo(combo):
 
 
 TOOL_SCOPES = {"type_text": "input", "press_key": "input", "mouse": "input", "terminal": "terminal",
-               "web": "web", "settings": "settings", "local_ai": "ui"}
+               "web": "web", "settings": "settings", "local_ai": "ui", "install_app": "admin",
+               "app_source": "admin", "app_eval": "admin"}
 
 
 class Agent:
@@ -249,10 +264,12 @@ class Agent:
         return self.on(lambda d: d.launch(app, x, y, w, h, **kw).info(True))
 
     @tool("window", "Manage a window. action: focus, close, move (x,y), resize (w,h), set_geometry (x,y,w,h), "
-          "maximize, restore, shade / unshade (roll up to the title bar), on_top / not_on_top (always on top).",
+          "maximize, restore, shade / unshade (roll up to the title bar), minimize / unminimize (to the "
+          "taskbar or Dock), on_top / not_on_top (always on top).",
           {"window_id": INT, "action": {"type": "string", "enum": ["focus", "close", "move", "resize",
                                                                     "set_geometry", "maximize", "restore", "shade",
-                                                                    "unshade", "on_top", "not_on_top"]},
+                                                                    "unshade", "minimize", "unminimize", "on_top",
+                                                                    "not_on_top"]},
            **GEOM}, ["window_id", "action"])
     def window(self, window_id, action, x=None, y=None, w=None, h=None):
         def do(d):
@@ -274,6 +291,8 @@ class Agent:
                 d.maximize(win, False)
             elif action in ("shade", "unshade"):
                 d.shade(win, action == "shade")
+            elif action in ("minimize", "unminimize"):
+                d.minimize(win, action == "minimize")
             elif action in ("on_top", "not_on_top"):
                 win.on_top = action == "on_top"
             return win.info(win is d.windows[-1])
@@ -319,12 +338,16 @@ class Agent:
 
     @tool("mouse", "Mouse action at (x, y): click, double_click, right_click, move, down, up, drag (to x2,y2), "
           "scroll (amount: + up / - down). With window_id, coordinates are relative to that window's client "
-          "area (and the window is not raised unless you click it).",
+          "area (and the window is not raised unless you click it). look: relative motion by x, y pixels, "
+          "as when an app has captured the mouse (mouse-look in 3D games).",
           {"action": {"type": "string", "enum": ["click", "double_click", "right_click", "move", "down", "up",
-                                                 "drag", "scroll"]},
+                                                 "drag", "scroll", "look"]},
            "x": INT, "y": INT, "x2": INT, "y2": INT, "button": {"type": "string", "enum": ["left", "right", "middle"]},
            "amount": INT, "window_id": INT}, ["action", "x", "y"])
     def mouse(self, action, x, y, x2=None, y2=None, button="left", amount=-3, window_id=None):
+        if action == "look":
+            self.inject([Mouse(int(x), int(y), 0, 0, web=True, rel=True)])
+            return {"done": "look", "by": [int(x), int(y)], "grabbed": self.on(lambda d: d.grab is not None)}
         ox, oy, W, H = self.on(lambda d: ((d.find(window_id).client()[:2] if window_id is not None else (0, 0))
                                           + (d.W, d.H)))
         clamp = lambda px, py: (max(0, min(W - 1, ox + int(px))), max(0, min(H - 1, oy + int(py))))
@@ -487,6 +510,9 @@ class Agent:
             if any(v is not None for v in (x, y, w, h)):
                 d.set_geometry(win, win.x if x is None else x, win.y if y is None else y,
                                win.w if w is None else w, win.h if h is None else h)
+            e = d.registry.entries.get(win.app.app_id or "")
+            if e and e.get("persist") and e.get("kind") == "panel":
+                d.registry.save_content(e["id"], dict(spec, title=win.app.title))   # reopens like this
             return win.info(win is d.windows[-1])
         return self.on(do)
 
@@ -666,9 +692,10 @@ class Agent:
         return {"shown": text}
 
     @tool("desktop_style", "Change the look: theme (classic = taskbar + Start menu, platinum = Mac OS 9-style "
-          "menu bar and pinstriped windows), background color, pattern, caption, wallpaper (image path or URL, "
+          "menu bar and pinstriped windows, aqua = Mac OS X-style menu bar, traffic-light windows and a Dock), "
+          "background color, pattern, caption, wallpaper (image path or URL, "
           "'' for none), wallpaper_mode (fill|fit|center|tile) and desktop icons on/off. Persists.",
-          {"theme": {"type": "string", "enum": ["classic", "platinum"]}, "background": STR, "pattern": BOOL,
+          {"theme": {"type": "string", "enum": ["classic", "platinum", "aqua"]}, "background": STR, "pattern": BOOL,
            "caption": STR, "wallpaper": STR, "wallpaper_mode": {"type": "string", "enum": ["fill", "fit", "center",
                                                                                             "tile"]},
            "icons": BOOL})
@@ -718,7 +745,319 @@ class Agent:
             return r
         return self.on(do)
 
-    @tool("unregister_app", "Remove an app added with register_app (and its saved manifest). Open windows stay.",
+    @tool("install_app", "Install (or update) a Python app that runs ON the desktop - for games, animations and "
+          "anything that needs real-time keyboard/mouse. It is saved to ~/.vga32/apps/<name>.py, loaded at once "
+          "and stays installed across restarts. Subclass vga32.game.GameApp for games: set app_id, title, icon, "
+          "category, width/height (logical canvas, scaled to the window), fps; write start(), update(dt) using "
+          "self.held('left') / self.pressed('space') / self.released(k) / self.pointer / self.clicked(), and "
+          "render(g) with g.clear, g.rect(x,y,w,h,color), g.frame, g.circle(cx,cy,r,color), g.line, g.poly, "
+          "g.pixel, g.text(x,y,s,color,size=small|medium|big,center=False), g.sprite(['.rr.','rrrr'],x,y,"
+          "colors={'r':'red'},scale=2,flip=False); put score etc. in game_state(). Colors are the 16 palette "
+          "names. For 3D: set mouse_look = True (click captures the mouse; self.mouse_delta() each update) and "
+          "use vga32.render3d - Scene/Mesh/Camera for polygon worlds (Mesh.cube/box/grid/sphere/cylinder/"
+          "pyramid/load_obj, scene.render(g, cam) then g.dither()) or Raycaster(map_rows, colors) for "
+          "corridors (world.move(cam, fwd, strafe), world.render(g, cam, sprites)). For forms and tools "
+          "subclass vga32.widgets.UIApp and return a widget tree from build(): Column, Row, Group, Label, "
+          "Button, Checkbox, Radio, Slider, TextField, ListBox, Dropdown, ProgressBar, CanvasView. "
+          "For big, textured scenes use the GPU engine vga32.gl3d (Renderer, MeshData, Material: textures, "
+          "lightmaps, lights, fog, skybox; r.render(cam) returns an image for g.blit) and vga32.quake to load "
+          "Quake 1 maps (quake.load(path).add_to(renderer), level.spawn_camera(), level.player(cam) for "
+          "collision). Set pixel = 2 to make the canvas follow the window size. "
+          "For editors and tools mixing UI and 3D: vga32.widgets.Viewport3D (a live 3D view widget with "
+          "orbit / pan / zoom and on_pick / on_drag), vga32.mesh.EditableMesh (extrude, inset, subdivide, "
+          "smooth, undo, OBJ) and vga32.formats.load_model (glTF / GLB / OBJ). Give the app cmd_<name> methods "
+          "so it can be driven with app_call. Full reference: dev_docs. "
+          "Any other vga32.ui.App subclass with an app_id works too. Errors (syntax, load, or the first "
+          "frames when open is true) come back in the result and as app.error events, so fix and reinstall. "
+          "open (default true) restarts running copies and opens it. Needs the admin scope.",
+          {"name": {"type": "string", "description": "file name, a Python identifier, e.g. snake_game"},
+           "source": STR, "open": BOOL, "desktop": {"type": "boolean", "description": "add a desktop icon"},
+           "assets": {"type": "object", "description": "files to put next to the app in ~/.vga32/apps/<name>/: "
+                      "{\"textures/wall.png\": base64 | \"text:...\" | \"https://...\"}. In the app: "
+                      "from vga32.registry import assets_dir; ASSETS = assets_dir(__file__)"}},
+          ["name", "source"])
+    def install_app(self, name, source, open=True, desktop=False, assets=None):
+        if assets:      # downloads happen here, not on the desktop thread
+            import re
+            from .settings import APPS_DIR
+            if not re.match(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$", name):
+                raise ToolError("name must be a Python identifier (letters, digits, _), e.g. snake_game")
+            try:
+                self.desk.registry._write_assets(os.path.join(APPS_DIR, name), assets)
+            except Exception as e:
+                return {"installed": [], "error": f"assets: {type(e).__name__}: {e}"}
+
+        def do(d):
+            try:
+                ids, err = d.registry.install(name, source)
+            except SyntaxError as e:
+                return {"installed": [], "error": f"SyntaxError line {e.lineno}: {e.msg}\n{(e.text or '').rstrip()}"}
+            out = {"installed": ids, "error": err}
+            if not ids:
+                out["error"] = err or "no App subclass with an app_id found in the source"
+                return out
+            for app_id in ids:
+                if desktop:
+                    d.pin_icon(app_id, True)
+                d.bus.publish("app.registered", app_id=app_id, owner=self.name)
+            if open:
+                old = [w for w in d.windows if w.app.app_id in ids]
+                for w in old:
+                    d.close(w)
+                win = d.launch(ids[0])
+                out["window_id"] = win.id
+            d.dirty = True
+            return out
+        out = self.on(do)
+        if open and out.get("window_id"):
+            time.sleep(0.6)                      # let it run some frames, then report how it's doing
+
+            def check(d):
+                win = d.find(out["window_id"])
+                d.focus(win)
+                d.render()                       # draws now, so render() errors surface too
+                return win.info(True)
+            try:
+                info = self.on(check)
+                out["window"] = info
+                if info["details"].get("error"):
+                    out["error"] = info["details"]["error"]
+            except KeyError:
+                out["error"] = out.get("error") or "the window closed right after opening"
+        return out
+
+    @tool("ui", "Operate the native widgets of a window (UIApp windows and panels): get lists widgets with id, "
+          "type, value, label, options; set changes a widget's value (as if the user did it, so the app reacts); "
+          "click presses a button; focus moves keyboard focus.",
+          {"window_id": INT, "action": {"type": "string", "enum": ["get", "set", "click", "focus"]}, "id": STR,
+           "value": {}}, ["window_id", "action"])
+    def ui(self, window_id, action, id=None, value=None):
+        def do(d):
+            win = d.find(window_id)
+            app = win.app
+            if not hasattr(app, "widget_list"):
+                raise ToolError(f"window {window_id} has no widgets")
+            if action != "get":
+                w = app.find(id)
+                if w is None:
+                    raise ToolError(f"no widget {id!r}; ids: {[x.id for x in app.widget_list() if x.id]}")
+                if action == "set":
+                    w.set_value(value)
+                    w.changed()
+                elif action == "click":
+                    if not hasattr(w, "click"):
+                        raise ToolError(f"{id!r} is not a button")
+                    w.click()
+                elif action == "focus":
+                    app.focus_widget = w
+            items = [{"id": w.id, "type": type(w).__name__.lower(), "enabled": w.enabled,
+                      **({"value": w.value} if w.value is not None else {}),
+                      **({"label": w.label} if getattr(w, "label", None) else {}),
+                      **({"options": w.options} if hasattr(w, "options") else {}),
+                      **({"items": w.items} if hasattr(w, "items") else {})}
+                     for w in app.widget_list() if w.id is not None]
+            return {"window_id": window_id, "focus": getattr(app.focus_widget, "id", None), "widgets": items}
+        return self.on(do)
+
+    @tool("view3d", "Drive the 3D Viewer (GPU renderer for Quake 1 .bsp maps and .obj models). action open "
+          "(path; waits for loading), state (file, map info, camera, fps, triangles), camera (set any of x, y, z "
+          "in viewer units - Quake maps use Quake's x, y=up, z axes swapped: pass quake=true to give Quake "
+          "coordinates - and yaw / pitch in degrees, fov), walk (forward / side in -1..1 for seconds, with "
+          "collision and gravity unless noclip), mode (walk | noclip), spawn (index of info_player_* to jump to), "
+          "exposure (number, or null for auto), screenshot (full-color PNG of the view, width / height optional).",
+          {"action": {"type": "string", "enum": ["open", "state", "camera", "walk", "mode", "spawn", "exposure",
+                                                 "screenshot"]},
+           "path": STR, "window_id": WID, "x": NUM, "y": NUM, "z": NUM, "quake": BOOL, "yaw": NUM, "pitch": NUM,
+           "fov": NUM, "forward": NUM, "side": NUM, "seconds": NUM, "mode": STR, "index": INT,
+           "value": {"type": ["number", "null"]}, "width": INT, "height": INT}, ["action"])
+    def view3d(self, action, path=None, window_id=None, x=None, y=None, z=None, quake=False, yaw=None, pitch=None,
+               fov=None, forward=0.0, side=0.0, seconds=1.0, mode=None, index=None, value=None, width=None,
+               height=None):
+        import math
+        from .viewer3d import Viewer3D
+
+        def get(d):
+            if action == "open" and window_id is None:
+                return d.launch("viewer3d", path=path) if path else d.find_app(Viewer3D)
+            return d.find_app(Viewer3D, window_id)
+        win = self.on(get)
+        v = win.app
+        if action == "open":
+            if not path:
+                raise ToolError("open needs path")
+            if os.path.abspath(os.path.expanduser(path)) != v.path:
+                self.on(lambda d: v.open(path))
+            self._wait(lambda d: True if (not v.loading and v.pending is None and v.renderer is not None)
+                       or not v.loading and v.pending is None and v.renderer is None else None, 60)
+        elif action == "camera":
+            def do(d):
+                cam = v.cam
+                if any(c is not None for c in (x, y, z)):
+                    p = list(cam.pos)
+                    if quake:
+                        from .quake import q2gl, gl2q
+                        q = list(gl2q(cam.pos))
+                        q = [q[0] if x is None else x, q[1] if y is None else y, q[2] if z is None else z]
+                        p = list(q2gl(q))
+                    else:
+                        p = [p[0] if x is None else x, p[1] if y is None else y, p[2] if z is None else z]
+                    cam.pos = __import__("numpy").array(p, float)
+                if yaw is not None:
+                    cam.yaw = math.radians(yaw)
+                if pitch is not None:
+                    cam.pitch = math.radians(pitch)
+                if fov is not None:
+                    cam.fov = float(fov)
+            self.on(do)
+        elif action == "walk":
+            def step(d):
+                if v.player is not None:
+                    v.player.update(1 / 30, float(forward), float(side))
+                else:
+                    v.cam.fly(float(forward) * 0.1, float(side) * 0.1)
+            for _ in range(max(1, int(float(seconds) * 30))):
+                self.on(step)
+        elif action == "mode":
+            if v.player is None:
+                raise ToolError("walk / noclip modes are for Quake maps")
+            self.on(lambda d: setattr(v.player, "noclip", (mode or "noclip") == "noclip"))
+        elif action == "spawn":
+            self.on(lambda d: v.respawn(int(index or 0)))
+        elif action == "exposure":
+            def ex(d):
+                if v.renderer is None:
+                    raise ToolError("nothing loaded")
+                if value is None:
+                    v.renderer.auto_exposure = 0.36
+                else:
+                    v.renderer.auto_exposure, v.renderer.exposure = None, float(value)
+            self.on(ex)
+        elif action == "screenshot":
+            def shot(d):
+                if v.renderer is None:
+                    raise ToolError("nothing loaded")
+                w0, h0 = v.renderer.width, v.renderer.height
+                img = v.renderer.render(v.cam, int(width or 640), int(height or 400))
+                v.renderer.resize(w0, h0)
+                return img
+            img = self.on(shot)
+            buf = io.BytesIO()
+            img.save(buf, "PNG")
+            return ImageResult(buf.getvalue(), {"window_id": win.id, **{k: v.game_state()[k] for k in ("file", "camera")}})
+        return self.on(lambda d: {"window_id": win.id, **v.game_state()})
+
+    # ---------- building and debugging apps ----------
+    def _app_window(self, d, window_id=None, app_id=None):
+        if window_id is not None:
+            return d.find(window_id)
+        if app_id:
+            win = next((w for w in reversed(d.windows) if w.app.app_id == app_id), None)
+            if win is None:
+                raise ToolError(f"no open window of {app_id!r}; open_app it first")
+            return win
+        if not d.windows:
+            raise ToolError("no windows open")
+        return d.windows[-1]
+
+    @tool("dev_docs", "Reference for building apps, generated from the code. topic: overview (start here: "
+          "how apps work, base classes, a full example), app, game, widgets, gl3d (GPU 3D), mesh (editable "
+          "polygon meshes), formats (glTF / OBJ loading), render3d (cameras, CPU 3D), quake, panel, events, "
+          "palette.", {"topic": STR})
+    def dev_docs(self, topic="overview"):
+        from .docs import describe
+        try:
+            return {"topic": topic, "text": describe(topic)}
+        except ValueError as e:
+            raise ToolError(str(e))
+
+    @tool("app_call", "Call a command on a running app: runs its cmd_<command>(**args) method and returns the "
+          "result. command 'commands' lists what an app offers, 'state' returns its state. Target by "
+          "window_id, or app_id (its topmost window), or the focused window.",
+          {"command": STR, "args": {"type": "object"}, "window_id": INT, "app_id": STR}, ["command"])
+    def app_call(self, command, args=None, window_id=None, app_id=None):
+        def do(d):
+            win = self._app_window(d, window_id, app_id)
+            try:
+                r = win.app.on_command(command, args or {})
+            except ToolError:
+                raise
+            except Exception as e:
+                import traceback
+                d.app_log(win.app.app_id or "?", f"command {command} failed:\n" + traceback.format_exc(limit=6))
+                raise ToolError(f"{type(e).__name__}: {e}") from e
+            d.dirty = True
+            return {"window_id": win.id, "result": json.loads(json.dumps(r, default=lambda o: o.tolist()
+                                                                         if hasattr(o, "tolist") else str(o)))}
+        return self.on(do, timeout=60)
+
+    @tool("app_eval", "Run Python inside a running app to inspect or change it live (debugging, quick "
+          "patches). In scope: app, desk, win, np, and every vga32 module as v (v.gl3d, v.mesh...). The value of "
+          "a final expression is returned with anything printed. Runs on the desktop thread: keep it quick. "
+          "Needs the admin scope.", {"code": STR, "window_id": INT, "app_id": STR}, ["code"])
+    def app_eval(self, code, window_id=None, app_id=None):
+        import ast
+        import contextlib
+        import importlib
+        import numpy as np
+
+        def do(d):
+            win = self._app_window(d, window_id, app_id) if (window_id is not None or app_id or d.windows) else None
+            v = type("vga32", (), {m: importlib.import_module("vga32." + m) for m in
+                                   ("gl3d", "mesh", "formats", "render3d", "widgets", "game", "ui", "palette")})
+            env = {"app": win.app if win else None, "win": win, "desk": d, "np": np, "v": v}
+            tree = ast.parse(code)
+            last = tree.body.pop() if tree.body and isinstance(tree.body[-1], ast.Expr) else None
+            buf = io.StringIO()
+            result = None
+            try:
+                with contextlib.redirect_stdout(buf):
+                    exec(compile(tree, "<app_eval>", "exec"), env)
+                    if last is not None:
+                        result = eval(compile(ast.Expression(last.value), "<app_eval>", "eval"), env)
+            except Exception as e:
+                import traceback
+                return {"error": traceback.format_exc(limit=4), "output": buf.getvalue()[-5000:]}
+            d.dirty = True
+            return {"result": repr(result)[:10000] if result is not None else None, "output": buf.getvalue()[-10000:]}
+        return self.on(do, timeout=60)
+
+    @tool("app_logs", "Log lines of an app: what it wrote with self.log(...) and tracebacks of crashes in its "
+          "draw / input / tick / commands. Without app_id: which apps have logs.",
+          {"app_id": STR, "limit": INT, "clear": BOOL})
+    def app_logs(self, app_id=None, limit=100, clear=False):
+        def do(d):
+            if not app_id:
+                return {"apps": {k: len(v) for k, v in d.app_logs.items()}}
+            log = list(d.app_logs.get(app_id, []))[-int(limit):]
+            if clear:
+                d.app_logs.pop(app_id, None)
+            return {"app_id": app_id, "lines": [{"time": t, "text": s} for t, s in log]}
+        return self.on(do)
+
+    @tool("app_data", "An app's persistent storage (self.storage, saved in ~/.vga32/apps/data/<app_id>.json): "
+          "get, set (merge values), or replace.",
+          {"app_id": STR, "action": {"type": "string", "enum": ["get", "set", "replace"]}, "values": {"type": "object"}},
+          ["app_id", "action"])
+    def app_data(self, app_id, action, values=None):
+        def do(d):
+            data = d.app_storage(app_id)
+            if action in ("set", "replace"):
+                data = dict(values or {}) if action == "replace" else {**data, **(values or {})}
+                d.save_app_storage(app_id, data)
+                for w in d.windows:          # open windows see the new data
+                    if w.app.app_id == app_id:
+                        w.app._storage = data
+            return {"app_id": app_id, "data": data}
+        return self.on(do)
+
+    @tool("app_source", "Read the Python source of an installed app (to fix or extend it), by app id.",
+          {"app_id": STR}, ["app_id"])
+    def app_source(self, app_id):
+        path, src = self.on(lambda d: d.registry.source(app_id))
+        return {"app_id": app_id, "file": path, "source": src}
+
+    @tool("unregister_app", "Remove an app added with register_app or install_app (deletes its saved manifest, "
+          "plugin file and saved content). Open windows stay.",
           {"id": STR}, ["id"])
     def unregister_app(self, id):
         def do(d):
@@ -912,6 +1251,9 @@ class Agent:
             data = self.on(lambda d: d.settings.public())
         elif uri == "vga32://clipboard":
             return {"uri": uri, "mimeType": "text/plain", "text": self.desk.clipboard}
+        elif uri.startswith("vga32://docs/"):
+            from .docs import describe
+            return {"uri": uri, "mimeType": "text/markdown", "text": describe(uri.rsplit("/", 1)[1])}
         elif uri == "vga32://notes":
             return {"uri": uri, "mimeType": "text/plain",
                     "text": self.on(lambda d: d.find_app(Notes, create=False).app.text
@@ -940,4 +1282,7 @@ RESOURCES = [
      "description": "Persistent settings (secrets masked)"},
     {"uri": "vga32://clipboard", "name": "clipboard", "mimeType": "text/plain", "description": "Clipboard text"},
     {"uri": "vga32://notes", "name": "notes", "mimeType": "text/plain", "description": "The Notes text"},
-]
+] + [{"uri": f"vga32://docs/{t}", "name": f"docs: {t}", "mimeType": "text/markdown",
+      "description": f"App development reference: {t}"} for t in
+     ("overview", "app", "game", "widgets", "gl3d", "mesh", "formats", "render3d", "quake", "panel", "events",
+      "palette")]

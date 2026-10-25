@@ -35,6 +35,12 @@ MANIFEST_KEYS = {"id", "title", "icon", "category", "kind", "owner", "size", "si
                  "spec", "menu", "url", "command", "webhook", "persist", "description", "hidden"}
 
 
+def assets_dir(module_file):
+    """The asset folder of an installed app: ~/.vga32/apps/<name>/ for ~/.vga32/apps/<name>.py.
+    Use it in an app as  ASSETS = assets_dir(__file__)  then os.path.join(ASSETS, "wall.png")."""
+    return os.path.splitext(os.path.abspath(module_file))[0]
+
+
 class AppRegistry:
     def __init__(self):
         self.entries = {}          # id -> entry dict; "cls" for builtin/python
@@ -83,10 +89,100 @@ class AppRegistry:
         e = self.entries.get(app_id)
         if e is None:
             raise KeyError(f"no app {app_id!r}")
-        if e["kind"] in ("builtin", "python"):
-            raise ValueError(f"{app_id!r} is a built-in or plugin app; delete its file to remove it")
-        del self.entries[app_id]
-        self._delete_file(app_id)
+        if e["kind"] == "builtin":
+            raise ValueError(f"{app_id!r} is a built-in app")
+        if e["kind"] == "python":
+            path = e.get("file", "")
+            if os.path.dirname(os.path.abspath(path)) != os.path.abspath(APPS_DIR):
+                raise ValueError(f"{app_id!r} comes from {path}; delete that file to remove it")
+            for other in [k for k, v in self.entries.items() if v.get("file") == path]:
+                del self.entries[other]
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        else:
+            del self.entries[app_id]
+            self._delete_file(app_id)
+        self.forget_content(app_id)
+
+    # ----- python plugins installed at runtime -----
+    def install(self, name, source, assets=None):
+        """Write ~/.vga32/apps/<name>.py (+ assets into ~/.vga32/apps/<name>/) and (re)load it.
+        assets: {relative file name: base64 data, "text:..." or an http(s) URL to download}.
+        Returns (app ids, error or None)."""
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$", name):
+            raise ValueError("name must be a Python identifier (letters, digits, _), e.g. snake_game")
+        os.makedirs(APPS_DIR, exist_ok=True)
+        path = os.path.join(APPS_DIR, name + ".py")
+        compile(source, path, "exec")                  # syntax errors raise here, before anything is saved
+        if assets:
+            self._write_assets(os.path.join(APPS_DIR, name), assets)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(source)
+        return self.reload_plugin(path)
+
+    @staticmethod
+    def _write_assets(folder, assets):
+        import base64
+        import urllib.request
+        root = os.path.abspath(folder)
+        for rel, data in assets.items():
+            dest = os.path.abspath(os.path.join(root, rel))
+            if not dest.startswith(root + os.sep):
+                raise ValueError(f"asset path {rel!r} leaves the app folder")
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            if isinstance(data, str) and data.startswith(("http://", "https://")):
+                req = urllib.request.Request(data, headers={"User-Agent": "vga32"})
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    blob = r.read(64 << 20)
+            elif isinstance(data, str) and data.startswith("text:"):
+                blob = data[5:].encode("utf-8")
+            else:
+                blob = base64.b64decode(data.split(",", 1)[1] if str(data).startswith("data:") else data)
+            with open(dest, "wb") as f:
+                f.write(blob)
+
+    def reload_plugin(self, path):
+        path = os.path.abspath(path)
+        for k in [k for k, v in self.entries.items() if v.get("file") == path]:
+            del self.entries[k]
+        n = len(self.errors)
+        self.load_plugin(path)
+        err = self.errors[n] if len(self.errors) > n else None
+        if err:
+            del self.errors[n:]
+        ids = [k for k, v in self.entries.items() if v.get("file") == path]
+        return ids, err
+
+    def source(self, app_id):
+        e = self.get(app_id)
+        if e["kind"] != "python" or not e.get("file"):
+            raise ValueError(f"{app_id!r} is not a Python plugin")
+        with open(e["file"], encoding="utf-8") as f:
+            return e["file"], f.read()
+
+    # ----- saved panel content, so a persistent app reopens as it was last drawn -----
+    def _content_path(self, app_id):
+        return os.path.join(APPS_DIR, "state", app_id + ".json")
+
+    def save_content(self, app_id, spec):
+        os.makedirs(os.path.dirname(self._content_path(app_id)), exist_ok=True)
+        with open(self._content_path(app_id), "w", encoding="utf-8") as f:
+            json.dump(strip_private(spec), f)
+
+    def load_content(self, app_id):
+        try:
+            with open(self._content_path(app_id), encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
+
+    def forget_content(self, app_id):
+        try:
+            os.remove(self._content_path(app_id))
+        except OSError:
+            pass
 
     def _path(self, app_id):
         return os.path.join(APPS_DIR, app_id + ".json")
@@ -117,6 +213,7 @@ class AppRegistry:
     def load_plugin(self, path):
         name = "vga32_app_" + re.sub(r"\W", "_", os.path.splitext(os.path.basename(path))[0])
         try:
+            path = os.path.abspath(path)
             spec = importlib.util.spec_from_file_location(name, path)
             mod = importlib.util.module_from_spec(spec)
             sys.modules[name] = mod

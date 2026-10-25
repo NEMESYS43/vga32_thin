@@ -4,7 +4,7 @@ When the user answers (or closes the window), a dialog.result event is published
 {dialog_id (= window id), button, value} and the window closes.
 """
 from .palette import C
-from .panel import _wrap
+from .ui import wrap_text as _wrap
 from .ui import CH, FONT, App, bevel, draw_glyph, text_size
 
 KINDS = ("message", "confirm", "input", "choice")
@@ -18,8 +18,9 @@ class Dialog(App):
     category = "System"
 
     def __init__(self, desk, kind="message", text="", title=None, buttons=None, value="", options=None,
-                 icon=None, **kw):
+                 icon=None, on_result=None, **kw):
         super().__init__(desk)
+        self.on_result = on_result
         if kind not in KINDS:
             raise ValueError(f"kind must be one of {', '.join(KINDS)}")
         self.kind = kind
@@ -53,6 +54,8 @@ class Dialog(App):
                               app_id="dialog")
         if win is not None:
             self.desk.close(win)
+        if self.on_result:
+            self.on_result(button, value)
 
     def close(self):
         if self.answered is None:          # closed with the X: counts as the last (cancel) button

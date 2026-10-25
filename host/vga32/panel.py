@@ -9,10 +9,22 @@ Element types (coordinates are inside the panel; omit "y" to stack below the pre
   chart    x, y, w, h, values [...], kind line|bars, color, min, max
   list     x, y, items [...], color, bullet
   table    x, y, rows [[...]], header (bool), widths [px...], color
-  button   id, x, y, w, h, label, color, bg   -> clicks show up in panel events
   image    x, y, w, h, src (http(s) URL, file path, data URI or base64), dither (bool), fit (bool)
-  input    id, x, y, w, label, value, placeholder   -> a text field; Enter sends panel.submit
-  checkbox id, x, y, label, checked                 -> toggling sends panel.change
+Interactive elements are native widgets (widgets.py), drawn in the current theme's style:
+  button   id, x, y, w, h, label, default        -> panel.click {id}
+  input    id, x, y, w, label, value, placeholder, password  -> Enter sends panel.submit
+  checkbox id, x, y, label, checked              -> panel.change {id, value}
+  radio    id, x, y, options [...], value, horizontal
+  slider   id, x, y, w, min, max, step, value, label, show_value
+  select   id, x, y, w, options [...], value, label (a dropdown)
+  listbox  id, x, y, w, h, items [...], selected, rows   (double-click / Enter -> panel.submit)
+  progress x, y, w, h, value, max
+  textarea id, x, y, w, rows, value, readonly     (multi-line; reported on change)
+  number   id, x, y, w, value, min, max, step, label
+  switch   id, x, y, label, value
+  color    id, x, y, value (a palette color name)
+Changes send panel.change {id, value, values}. The user's values persist across panel updates;
+add "reset": true to an element to put its value back to what the element says. Tab moves focus.
 
 A spec may also declare menus:
   "menu": [{"id": "refresh", "label": "Refresh"}, ...]                 right-click menu
@@ -24,8 +36,9 @@ import time
 from PIL import Image
 
 from . import images
+from .widgets import WidgetHost
 from .palette import C
-from .ui import CH, CW, FONT, FONTS, App, bevel, parse_color, text_size
+from .ui import CH, CW, FONT, FONTS, App, bevel, parse_color, text_size, wrap_text
 
 GAP = 4
 
@@ -38,26 +51,75 @@ def prepare(elements):
     return elements
 
 
-def _wrap(text, font, width):
-    out = []
-    for para in str(text).split("\n"):
-        words, line = para.split(" "), ""
-        for w in words:
-            t = w if not line else line + " " + w
-            if width and font.getlength(t) > width and line:
-                out.append(line)
-                line = w
-            else:
-                line = t
-        out.append(line)
-    return out
+_wrap = wrap_text      # older name, used by a few apps
 
 
-def render_elements(img, d, elements, W, H, background=C.white, state=None, fields=None):
-    """Draw onto (img, d). Returns [(id, x, y, w, h)] for buttons. Input and checkbox elements
-    read their live values from state {"values", "focus"} and are listed in fields."""
+WIDGET_TYPES = ("button", "input", "checkbox", "radio", "slider", "select", "listbox", "progress", "textarea",
+                "number", "switch", "color")
+
+
+def make_widget(e):
+    from . import widgets as W_
+    t, wid = e["type"], str(e.get("id", e["type"]))
+    if t == "button":
+        return W_.Button(str(e.get("label", wid)), id=wid, default=bool(e.get("default")))
+    if t == "input":
+        return W_.TextField(e.get("value", ""), e.get("placeholder", ""), bool(e.get("password")),
+                            label=e.get("label"), id=wid)
+    if t == "checkbox":
+        return W_.Checkbox(e.get("label", ""), bool(e.get("checked")), id=wid)
+    if t == "radio":
+        return W_.Radio(e.get("options", []), e.get("value"), bool(e.get("horizontal")), id=wid)
+    if t == "slider":
+        return W_.Slider(e.get("min", 0), e.get("max", 100), e.get("value", 0), e.get("step", 1), e.get("label"),
+                         e.get("show_value", True), id=wid)
+    if t == "select":
+        return W_.Dropdown(e.get("options", []), e.get("value"), e.get("label"), id=wid)
+    if t == "listbox":
+        return W_.ListBox(e.get("items", []), e.get("selected"), int(e.get("rows", 6)), id=wid)
+    if t == "textarea":
+        return W_.TextArea(e.get("value", ""), int(e.get("rows", 5)), bool(e.get("readonly")), id=wid)
+    if t == "number":
+        return W_.NumberField(e.get("value", 0), e.get("min"), e.get("max"), e.get("step", 1), e.get("label"), id=wid)
+    if t == "switch":
+        return W_.Switch(e.get("label", ""), bool(e.get("value", e.get("checked"))), id=wid)
+    if t == "color":
+        return W_.ColorPicker(e.get("value", "black"), id=wid)
+    return W_.ProgressBar(e.get("value", 0), e.get("max", 100), id=wid)
+
+
+def update_widget(w, e):
+    """Refresh a cached widget from its element, keeping what the user entered unless reset."""
+    if "label" in e and hasattr(w, "label"):
+        w.label = None if e["label"] is None else str(e["label"])
+    if "placeholder" in e and hasattr(w, "placeholder"):
+        w.placeholder = str(e["placeholder"])
+    if "options" in e and hasattr(w, "options"):
+        w.options = [str(o) for o in e["options"]]
+    if "items" in e and hasattr(w, "items"):
+        w.items = [str(o) for o in e["items"]]
+    if e["type"] == "slider":
+        for k in ("min", "max", "step"):
+            if k in e:
+                setattr(w, k, float(e[k]))
+    if e["type"] == "progress" and "max" in e:
+        w.max = e["max"]
+    if "default" in e and hasattr(w, "default"):
+        w.default = bool(e["default"])
+    w.enabled = e.get("enabled", True)
+    if e.get("reset") or e["type"] == "progress":
+        for k in ("value", "checked", "selected"):
+            if k in e:
+                w.set_value(e[k])
+
+
+def render_elements(img, d, elements, W, H, background=C.white, host=None):
+    """Draw onto (img, d). Returns [(id, x, y, w, h)] for buttons. Interactive elements become
+    widgets; with a host (a Panel) they are kept between frames in host.widgets, and the ones
+    drawn this frame are listed in host.drawn."""
+    from .widgets import Ctx
     buttons, cy = [], GAP
-    fields = [] if fields is None else fields
+    drawn = []
     # Default text color contrasts with the background, so a dark panel doesn't hide unstyled text.
     ink = C.white if sum(background) < 300 else C.black
     for e in elements:
@@ -66,7 +128,21 @@ def render_elements(img, d, elements, W, H, background=C.white, state=None, fiel
         y = int(e["y"]) if "y" in e else cy
         w = int(e.get("w", W - x - 8))
         h = int(e.get("h", 0))
-        if t == "text":
+        if t in WIDGET_TYPES:
+            wdg = host.widget_for(e) if host is not None else make_widget(e)
+            if "w" in e:
+                ww = w
+            elif t in ("button", "checkbox", "radio", "select"):
+                ww = min(W - x - 8, wdg.pref_w())
+            else:
+                ww = W - x - 8
+            h = h or wdg.pref_h(ww)
+            wdg.layout(x, y, ww, h)
+            wdg.draw(d, Ctx(host, img, ink))
+            drawn.append(wdg)
+            if t == "button":
+                buttons.append((wdg.id, x, y, ww, h))
+        elif t == "text":
             font = FONTS.get(e.get("size", "small"), FONT)
             col = parse_color(e.get("color"), ink)
             lines = _wrap(e.get("text", ""), font, w if e.get("wrap", True) else 0)
@@ -156,44 +232,6 @@ def render_elements(img, d, elements, W, H, background=C.white, state=None, fiel
                     d.text((cx + 3, ry + 1), s, font=FONT, fill=col)
                     cx += cw
             h = CH * len(rows)
-        elif t == "button":
-            w = int(e.get("w", max(60, text_size(e.get("label", ""))[0] + 20)))
-            h = h or 22
-            bevel(d, x, y, w, h, face=parse_color(e.get("bg"), C.gray))
-            label = str(e.get("label", e.get("id", "")))
-            tw, th = text_size(label)
-            d.text((x + (w - tw) / 2, y + (h - th) / 2 - 1), label, font=FONT, fill=parse_color(e.get("color"), C.black))
-            buttons.append((str(e.get("id", label)), x, y, w, h))
-        elif t == "input":
-            h = h or 20
-            fid = str(e.get("id", "input"))
-            label = e.get("label")
-            fx = x
-            if label:
-                d.text((x, y + 3), str(label), font=FONT, fill=ink)
-                fx = x + int(FONT.getlength(str(label))) + 6
-            fw = max(20, w - (fx - x))
-            focused = state is not None and state.get("focus") == fid
-            d.rectangle([fx, y, fx + fw - 1, y + h - 1], fill=C.white, outline=C.blue if focused else C.darkgray)
-            val = state["values"].get(fid, e.get("value", "")) if state is not None else e.get("value", "")
-            shown = str(val) or ("" if focused else str(e.get("placeholder", "")))
-            while shown and FONT.getlength(shown) > fw - 8:
-                shown = shown[1:]
-            d.text((fx + 3, y + 3), shown, font=FONT, fill=C.black if val else C.darkgray)
-            if focused:
-                cx = fx + 4 + int(FONT.getlength(shown))
-                d.line([cx, y + 3, cx, y + h - 4], fill=C.black)
-            fields.append((fid, "input", fx, y, fw, h))
-        elif t == "checkbox":
-            h = h or 16
-            fid = str(e.get("id", "checkbox"))
-            on = state["values"].get(fid, bool(e.get("checked"))) if state is not None else bool(e.get("checked"))
-            d.rectangle([x, y + 1, x + 12, y + 13], fill=C.white, outline=C.black)
-            if on:
-                d.line([x + 2, y + 7, x + 5, y + 11, x + 11, y + 3], fill=C.black, width=2)
-            label = str(e.get("label", ""))
-            d.text((x + 18, y + 1), label, font=FONT, fill=ink)
-            fields.append((fid, "checkbox", x, y, 18 + int(FONT.getlength(label)), h))
         elif t == "image":
             src = e.get("_img")
             if src is not None:
@@ -214,10 +252,12 @@ def render_elements(img, d, elements, W, H, background=C.white, state=None, fiel
         else:
             raise ValueError(f"unknown element type {t!r}")
         cy = max(cy, y + h + GAP)
+    if host is not None:
+        host.drawn = drawn
     return buttons
 
 
-class Panel(App):
+class Panel(WidgetHost, App):
     title = "Panel"
     icon = "panel"
     size = (320, 200)
@@ -228,17 +268,33 @@ class Panel(App):
         self.spec = {}
         self.events = []
         self.buttons = []
-        self.pressed = None
-        self.fields = []           # (id, kind, x, y, w, h) of inputs and checkboxes
-        self.form = {"values": {}, "focus": None}
+        self.widgets = {}          # element id -> widget, kept so typed values survive updates
+        self.drawn = []            # widgets drawn in the last frame, in order
         self.set_spec(spec or {"elements": [{"type": "text", "text": "Empty panel"}]}, title)
 
     def set_spec(self, spec, title=None):
         self.spec = spec
         self.title = title or spec.get("title") or self.title
-        for e in spec.get("elements", []):
-            if e.get("type") in ("input", "checkbox") and "id" in e and e.get("reset"):
-                self.form["values"].pop(str(e["id"]), None)
+        ids = {str(e.get("id", e.get("type"))) for e in spec.get("elements", []) if e.get("type") in WIDGET_TYPES}
+        self.widgets = {k: v for k, v in self.widgets.items() if k in ids}
+        if self.focus_widget is not None and self.focus_widget not in self.widgets.values():
+            self.focus_widget = None
+
+    def widget_for(self, e):
+        wid = str(e.get("id", e["type"]))
+        w = self.widgets.get(wid)
+        fresh = make_widget(dict(e, id=wid)) if w is None or getattr(w, "_etype", None) != e["type"] else None
+        if fresh is not None:
+            w = fresh
+            w._etype = e["type"]
+            w.app = self
+            self.widgets[wid] = w
+        else:
+            update_widget(w, e)
+        return w
+
+    def widget_list(self):
+        return list(self.drawn)
 
     def window_id(self):
         return next((w.id for w in self.desk.windows if w.app is self), None)
@@ -253,14 +309,16 @@ class Panel(App):
             bus.publish(kind if "." in kind else "panel." + kind, window_id=self.window_id(), app_id=self.app_id,
                         **{k: v for k, v in e.items() if k not in ("type", "time")})
 
-    def values(self):
-        out = {}
-        for e in self.spec.get("elements", []):
-            if e.get("type") == "input" and "id" in e:
-                out[str(e["id"])] = self.form["values"].get(str(e["id"]), e.get("value", ""))
-            elif e.get("type") == "checkbox" and "id" in e:
-                out[str(e["id"])] = self.form["values"].get(str(e["id"]), bool(e.get("checked")))
-        return out
+    def widget_changed(self, w, **extra):
+        if getattr(w, "_etype", None) in ("input", "textarea"):     # typing: only Enter / submit is reported
+            return
+        self._event(type="change", id=w.id, value=w.value, values=self.values())
+
+    def widget_clicked(self, w):
+        self._event(type="click", id=w.id)
+
+    def widget_submitted(self, w):
+        self._event(type="submit", id=w.id, value=w.value, values=self.values())
 
     def context_menu(self, x, y):
         return self.spec.get("menu") or None
@@ -278,59 +336,33 @@ class Panel(App):
         return ev
 
     def mouse(self, x, y, buttons, pressed, released, wheel):
-        hit = next((b for b in self.buttons if b[1] <= x < b[1] + b[3] and b[2] <= y < b[2] + b[4]), None)
-        if pressed & 1:
-            self.pressed = hit
-            f = next((f for f in self.fields if f[2] <= x < f[2] + f[4] and f[3] <= y < f[3] + f[5]), None)
-            self.form["focus"] = f[0] if f and f[1] == "input" else None
-            if f and f[1] == "checkbox":
-                v = not self.values().get(f[0], False)
-                self.form["values"][f[0]] = v
-                self._event(type="change", id=f[0], value=v, values=self.values())
-        if released & 1:
-            if hit and self.pressed and hit[0] == self.pressed[0]:
-                self._event(type="click", id=hit[0])
-            self.pressed = None
+        self.route_mouse(x, y, buttons, pressed, released, wheel)
 
     def key(self, k):
-        if not k.down:
+        if self.route_key(k):
             return
-        fid = self.form["focus"]
-        if fid is not None:
-            val = str(self.values().get(fid, ""))
-            if k.name == "RETURN":
-                self._event(type="submit", id=fid, value=val, values=self.values())
-            elif k.name == "BACKSPACE":
-                self.form["values"][fid] = val[:-1]
-            elif k.name == "ESCAPE":
-                self.form["focus"] = None
-            elif k.name == "TAB":
-                ids = [f[0] for f in self.fields if f[1] == "input"]
-                self.form["focus"] = ids[(ids.index(fid) + 1) % len(ids)] if fid in ids else None
-            elif k.char and not k.ctrl:
-                self.form["values"][fid] = val + k.char
+        if k.down and k.name == "ESCAPE" and self.focus_widget is not None:
+            self.focus_widget = None
             return
-        self._event(type="key", name=k.name, char=k.char, mods=k.mods)
+        if k.down:
+            self._event(type="key", name=k.name, char=k.char, mods=k.mods)
 
     def copy(self):
         return "\n".join(str(e.get("text", "")) for e in self.spec.get("elements", []) if e.get("type") == "text")
 
     def paste(self, text):
-        if self.form["focus"] is not None:
-            fid = self.form["focus"]
-            self.form["values"][fid] = str(self.values().get(fid, "")) + text.replace("\n", " ")
+        if hasattr(self.focus_widget, "paste"):
+            self.focus_widget.paste(text)
+
+    def tick(self):
+        return any(type(w).__name__ == "ProgressBar" for w in self.drawn)
 
     def draw(self, d, x, y, w, h):
         bg = parse_color(self.spec.get("background"), C.white)
         d.rectangle([x, y, x + w - 1, y + h - 1], fill=bg)
-        self.fields = []
-        self.buttons = render_elements(self.desk.target, d, self.spec.get("elements", []), w, h, bg,
-                                       self.form, self.fields)
-        if self.pressed:
-            _, bx, by, bw, bh = self.pressed
-            d.rectangle([bx, by, bx + bw - 1, by + bh - 1], outline=C.blue, width=2)
+        self.buttons = render_elements(self.desk.target, d, self.spec.get("elements", []), w, h, bg, self)
 
     def state(self):
         return {"elements": len(self.spec.get("elements", [])), "pending_events": len(self.events),
                 "buttons": [b[0] for b in self.buttons], "values": self.values(),
-                "focus": self.form["focus"]}
+                "focus": getattr(self.focus_widget, "id", None)}

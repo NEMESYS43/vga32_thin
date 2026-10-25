@@ -26,6 +26,22 @@ BIG = load_font(28)
 FONTS = {"small": FONT, "normal": FONT, "medium": MEDIUM, "big": BIG}
 
 
+def wrap_text(text, font, width):
+    """Split text into lines no wider than width px (0 = only at newlines)."""
+    out = []
+    for para in str(text).split("\n"):
+        words, line = para.split(" "), ""
+        for w in words:
+            t = w if not line else line + " " + w
+            if width and font.getlength(t) > width and line:
+                out.append(line)
+                line = w
+            else:
+                line = t
+        out.append(line)
+    return out
+
+
 def text_size(s, font=FONT):
     l, t, r, b = font.getbbox(s or " ")
     return int(font.getlength(s)), b
@@ -149,6 +165,8 @@ class App:
     icon = "app"           # a draw_glyph name
     category = "Accessories"
     app_id = None          # set by the registry
+    adaptive_palette = False   # True: while focused, the screen's 16 colors are chosen to suit this app
+    palette_sample = None      # HxWx3 uint8 the app last rendered in full color (set by Canvas.dither)
 
     def __init__(self, desk, **kw):
         self.desk = desk
@@ -156,6 +174,60 @@ class App:
     def menus(self):
         """Extra menu-bar menus for this app: [(title, [item, ...])]. Items as in menu.Menu."""
         return []
+
+    def window(self):
+        return next((w for w in self.desk.windows if w.app is self), None)
+
+    # ----- talking to agents -----
+    def on_command(self, name, args):
+        """An agent called app_call(command=name, args=...). The default runs a method named
+        cmd_<name>(**args) and returns its result (JSON-able). Built in: "commands" lists them,
+        "state" returns state()."""
+        if name == "commands":
+            return {n[4:]: (getattr(self, n).__doc__ or "").strip().split("\n")[0]
+                    for n in dir(self) if n.startswith("cmd_") and callable(getattr(self, n))}
+        if name == "state":
+            return self.state()
+        fn = getattr(self, "cmd_" + str(name), None)
+        if fn is None:
+            raise ValueError(f"{type(self).__name__} has no command {name!r}; try 'commands'")
+        return fn(**(args or {}))
+
+    def emit(self, event, **data):
+        """Publish an event for agents: type "app.<event>" with this app's app_id and window_id."""
+        win = self.window()
+        self.desk.bus.publish("app." + event, app_id=self.app_id, window_id=win.id if win else None, **data)
+
+    def log(self, *parts):
+        """A line in this app's log (read by agents with app_logs)."""
+        self.desk.app_log(self.app_id or type(self).__name__, " ".join(str(p) for p in parts))
+
+    @property
+    def storage(self):
+        """A dict saved per app_id in ~/.vga32/apps/data/<app_id>.json; call save_storage() after changes."""
+        st = getattr(self, "_storage", None)
+        if st is None:
+            st = self._storage = self.desk.app_storage(self.app_id or type(self).__name__)
+        return st
+
+    def save_storage(self):
+        self.desk.save_app_storage(self.app_id or type(self).__name__, self.storage)
+
+    def grab_mouse(self, on=True):
+        """Capture the mouse (hidden cursor, relative motion to mouse_motion) until Esc."""
+        if on:
+            self.desk.grab_pointer(self.window())
+        elif self.mouse_grabbed:
+            self.desk.release_pointer()
+
+    @property
+    def mouse_grabbed(self):
+        g = getattr(self.desk, "grab", None)
+        return g is not None and g.app is self
+
+    def mouse_motion(self, dx, dy):
+        """Relative mouse motion while the mouse is captured (see grab_mouse)."""
+        pass
 
     def context_menu(self, x, y):
         """Items for a right-click at client (x, y), or None for no menu."""

@@ -25,13 +25,16 @@ import time
 from PIL import Image, ImageDraw
 
 from . import images
+from . import palette
 from . import theme as themes
+from .adaptive import PaletteManager
 from .apps import About, Clock, Notes, Paint, System, Terminal
 from .assistant import Assistant
 from .browser import Browser
 from .client import Info, Key, Mouse
 from .dialogs import Dialog
 from .events import EventBus
+from .filedialog import FileDialogApp
 from .files import Files
 from .menu import Menu
 from .palette import C
@@ -42,6 +45,7 @@ from .settings import Settings
 from .settings_app import SettingsApp
 from .ui import CH, CW, FONT, bevel, parse_color, text_size
 from .viewer import Viewer
+from .viewer3d import Viewer3D
 from .webview import WebView
 
 # id, class, registry fields
@@ -51,6 +55,7 @@ BUILTINS = [
     ("web", WebView, {"category": "Internet", "desktop": True}),
     ("browser", Browser, {"category": "Internet"}),
     ("viewer", Viewer, {"category": "Accessories"}),
+    ("viewer3d", Viewer3D, {"category": "Graphics"}),
     ("notes", Notes, {"category": "Accessories", "desktop": True}),
     ("paint", Paint, {"category": "Accessories"}),
     ("clock", Clock, {"category": "Accessories"}),
@@ -60,8 +65,9 @@ BUILTINS = [
     ("about", About, {"category": "System"}),
     ("panel", Panel, {"category": "Agents", "hidden": True}),
     ("dialog", Dialog, {"category": "System", "hidden": True}),
+    ("filedialog", FileDialogApp, {"category": "System", "hidden": True}),
 ]
-ALIASES = {"images": "viewer", "image": "viewer", "control_panel": "settings", "chat": "assistant"}
+ALIASES = {"images": "viewer", "image": "viewer", "3d": "viewer3d", "quake": "viewer3d", "bsp": "viewer3d", "control_panel": "settings", "chat": "assistant"}
 LAYOUTS = ["cascade", "tile", "rows", "grid", "main-left", "main-top", "maximize"]
 MIN_W = 140
 DOUBLE_CLICK = 0.35       # seconds between clicks to count as a double-click
@@ -80,6 +86,8 @@ class NullDevice:
 
     def wait_sync(self, *a, **k):
         return True
+
+    relative_mouse = False
 
     def batch(self):
         return contextlib.nullcontext()
@@ -109,6 +117,7 @@ class Window:
         self.x, self.y, self.w, self.h = x, y, w, h
         self.saved = None          # geometry before maximize
         self.shaded = False        # rolled up to just the title bar
+        self.minimized = False     # hidden; shown in the taskbar / Dock
         self.on_top = False
 
     @property
@@ -120,7 +129,7 @@ class Window:
         return themes.current().shaded_h() if self.shaded else self.h
 
     def contains(self, px, py):
-        return self.x <= px < self.x + self.w and self.y <= py < self.y + self.visible_h
+        return not self.minimized and self.x <= px < self.x + self.w and self.y <= py < self.y + self.visible_h
 
     def client(self):
         return themes.current().client(self)
@@ -130,7 +139,8 @@ class Window:
         return {"id": self.id, "app": type(self.app).__name__.lower(), "app_id": self.app.app_id,
                 "title": self.app.title, "x": self.x, "y": self.y, "w": self.w, "h": self.h,
                 "client": {"x": cx, "y": cy, "w": cw, "h": ch}, "focused": focused,
-                "maximized": self.saved is not None, "shaded": self.shaded, "on_top": self.on_top,
+                "maximized": self.saved is not None, "shaded": self.shaded, "minimized": self.minimized,
+                "on_top": self.on_top,
                 "details": self.app.state()}
 
 
@@ -159,6 +169,8 @@ class Desktop:
             self.registry.add_builtin(app_id, cls, **kw)
         self.registry.load_dir()
         self.bus = EventBus(self._webhooks_for)
+        self.palettes = PaletteManager(self)
+        self.app_logs = {}         # app id -> deque of (time, line)
         self.inbox = queue.Queue()
         self.dev = NullDevice(w, h)
         self.screen = Screen(self.dev)
@@ -173,6 +185,9 @@ class Desktop:
         self.drag = None           # (window, dx, dy)
         self.resize = None         # (window, x0, y0, w0, h0)
         self.capture = None        # window receiving mouse while a button is held
+        self.grab = None           # window that captured the mouse (mouse-look): gets relative motion
+        self.grab_state = {}
+        self.dock_hover = False
         self.icon_drag = None      # (app_id, dx, dy)
         self.icon_sel = None
         self.mx, self.my, self.buttons = w // 2, h // 2, 0
@@ -216,8 +231,22 @@ class Desktop:
         self.attach(NullDevice(self.W, self.H))
 
     def _apply_device(self):
-        """Send the theme's palette and cursor to the board."""
-        self.dev.palette(self.theme.palette)
+        """Send the current palette (the theme's, or an adaptive one) and the cursor to the board."""
+        self.dev.palette(palette.DISPLAY)
+        if self.grab is not None:
+            self._grab_device()
+            return
+        self._apply_cursor()
+
+    def _grab_device(self):
+        if getattr(self.dev, "relative_mouse", False):
+            self.dev.cursor_relative()           # the board sends raw deltas (firmware protocol 2)
+        else:
+            self.dev.cursor_hide()               # older firmware: hide and keep warping to the center
+            self.dev.warp(*self.grab_state["center"])
+            self.grab_state["pending"] = time.monotonic()
+
+    def _apply_cursor(self):
         cur = self.theme.cursor()
         if cur is None:
             self.dev.cursor_arrow()
@@ -248,13 +277,15 @@ class Desktop:
                     self.focus(win)
                     return win
         kind = e["kind"]
+        saved = None
         size = e.get("size")
         if size and w is None and h is None:
             w, h = self.theme.frame_size(int(size[0]), int(size[1]))
         if kind in ("builtin", "python"):
             win = self.open(e["cls"], x, y, w, h, **kw)
         elif kind == "panel":
-            spec = copy.deepcopy(e.get("spec") or {"elements": [{"type": "text", "text": "Starting..."}]})
+            saved = self.registry.load_content(e["id"]) if e.get("persist") else None
+            spec = saved or copy.deepcopy(e.get("spec") or {"elements": [{"type": "text", "text": "Starting..."}]})
             spec.setdefault("title", e["title"])
             if e.get("menu") and "menu" not in spec:
                 spec["menu"] = e["menu"]
@@ -270,7 +301,8 @@ class Desktop:
             raise ValueError(f"can't launch kind {kind!r}")
         win.app.app_id = e["id"]
         if kind not in ("builtin",):
-            self.bus.publish("app.launched", app_id=e["id"], window_id=win.id, owner=e.get("owner"))
+            self.bus.publish("app.launched", app_id=e["id"], window_id=win.id, owner=e.get("owner"),
+                             restored=kind == "panel" and saved is not None)
         return win
 
     def _prepare_async(self, win, elements):
@@ -328,6 +360,8 @@ class Desktop:
     def close(self, win):
         if win not in self.windows:
             return
+        if self.grab is win:
+            self.release_pointer()
         win.app.close()
         self.windows.remove(win)
         if self.capture is win:
@@ -340,6 +374,11 @@ class Desktop:
         self.bus.publish("window.closed", window_id=win.id, app_id=win.app.app_id, title=win.title)
 
     def focus(self, win):
+        if win.minimized:
+            win.minimized = False
+            self.bus.publish("window.restored", window_id=win.id, app_id=win.app.app_id)
+        if self.grab is not None and self.grab is not win:
+            self.release_pointer()
         if self.windows[-1] is not win:
             self.windows.remove(win)
             self.windows.append(win)
@@ -347,8 +386,95 @@ class Desktop:
         self.dirty = True
 
     def stack(self):
-        """Windows bottom to top as drawn: always-on-top windows last."""
-        return [w for w in self.windows if not w.on_top] + [w for w in self.windows if w.on_top]
+        """Visible windows bottom to top as drawn: always-on-top windows last."""
+        return [w for w in self.windows if not w.on_top and not w.minimized] + \
+               [w for w in self.windows if w.on_top and not w.minimized]
+
+    def minimize(self, win, on=True):
+        if on == win.minimized:
+            return
+        if not on:
+            self.focus(win)
+            return
+        win.minimized = True
+        if self.grab is win:
+            self.release_pointer()
+        if self.capture is win:
+            self.capture = None
+        self.windows.remove(win)          # to the bottom, so the next window gets focus
+        self.windows.insert(0, win)
+        self.dirty = True
+        self.bus.publish("window.minimized", window_id=win.id, app_id=win.app.app_id)
+
+    # ----- mouse capture (mouse-look for 3D apps) -----
+    def grab_pointer(self, win):
+        """Hide the cursor and send win relative motion (app.mouse_motion) until released (Esc)."""
+        if win is None or win.minimized or self.grab is win:
+            return
+        self.grab = win
+        cx, cy, cw, ch = win.client()
+        center = (cx + cw // 2, cy + ch // 2)
+        self.grab_state = {"center": center, "last": (self.mx, self.my), "pending": 0}
+        self._grab_device()
+        self.focus(win)
+        self.dirty = True
+        self.bus.publish("pointer.grabbed", window_id=win.id, app_id=win.app.app_id)
+
+    def grab_zones(self):
+        """Client rects of visible mouse-look windows (the web remote locks the pointer on a click there)."""
+        return [w.client() for w in self.stack()
+                if getattr(w.app, "mouse_look", False) and not getattr(w.app, "error", None) and not w.shaded]
+
+    def release_pointer(self):
+        win, self.grab = self.grab, None
+        if win is None:
+            return
+        # The pointer comes back where the user was looking: the middle of the window.
+        cx, cy = self.grab_state.get("center", (self.mx, self.my))
+        self._apply_cursor()
+        self.dev.warp(cx, cy)
+        self.web_warps.append((cx, cy, time.monotonic()))
+        self.mx, self.my = cx, cy
+        if hasattr(win.app, "on_grab"):
+            win.app.on_grab(False)
+        self.dirty = True
+        self.bus.publish("pointer.released", window_id=win.id, app_id=win.app.app_id)
+
+    def _grab_mouse(self, m):
+        """Mouse while captured: deltas to the app, buttons and wheel at the window center."""
+        win = self.grab
+        pressed, released = m.buttons & ~self.buttons, self.buttons & ~m.buttons
+        self.buttons = m.buttons
+        st = self.grab_state
+        cx, cy = st["center"]
+        now = time.monotonic()
+        dx = dy = 0
+        if m.rel:
+            dx, dy = m.x, m.y
+        elif not m.web and not getattr(self.dev, "relative_mouse", False):
+            # Older firmware (no relative mode): the board moves its own cursor, which we warp back
+            # to the center now and then. Until the warp has landed, a report may be from before it
+            # (relative to the last position) or after it (relative to the center); whichever is
+            # nearer is the one it came from.
+            p, last = (m.x, m.y), st["last"]
+            if st["pending"] and now - st["pending"] < 0.5:
+                if abs(p[0] - cx) + abs(p[1] - cy) <= abs(p[0] - last[0]) + abs(p[1] - last[1]):
+                    last = (cx, cy)
+                    st["pending"] = 0
+            else:
+                st["pending"] = 0
+            dx, dy = p[0] - last[0], p[1] - last[1]
+            st["last"] = p
+            if not st["pending"] and (abs(p[0] - cx) > 100 or abs(p[1] - cy) > 70):
+                self.dev.warp(cx, cy)
+                st["pending"] = now
+        if dx or dy:
+            self.safe(win.app, "mouse_motion", dx, dy)
+            self.dirty = True
+        if pressed or released or m.wheel:
+            wx, wy, _, _ = win.client()
+            self.safe(win.app, "mouse", cx - wx, cy - wy, m.buttons, pressed, released, m.wheel)
+            self.dirty = True
 
     def find(self, wid):
         for w in self.windows:
@@ -467,6 +593,7 @@ class Desktop:
     # ----- settings, theme, background -----
     def set_theme(self, name):
         old = self.theme.name
+        self.palettes.reset()
         self.theme = themes.activate(name)
         if self.settings["theme"] != name:
             self.settings.set("theme", name)
@@ -664,6 +791,7 @@ class Desktop:
 
     def window_menu_items(self, win):
         return [{"label": "Restore" if win.saved else "Maximize", "action": lambda: self.maximize(win)},
+                {"label": "Minimize", "action": lambda: self.minimize(win)},
                 {"label": "Roll Down" if win.shaded else "Roll Up", "action": lambda: self.shade(win)},
                 {"label": "Always on Top", "checked": win.on_top,
                  "action": lambda: setattr(win, "on_top", not win.on_top)},
@@ -698,7 +826,7 @@ class Desktop:
                  "action": lambda: self.paste_into(win)}]
         out = [("File", file_), ("Edit", edit)]
         for title, items in win.app.menus() or []:
-            out.append((title, [dict(it, action=(lambda i=it: win.app.on_menu(i.get("id"))))
+            out.append((title, [dict(it, action=(lambda i=it: self.safe(win.app, "on_menu", i.get("id"))))
                                 if it.get("items") is None and not it.get("separator") and "action" not in it
                                 else it for it in items]))
         window = self.window_list_items() + [{"separator": True}, {"label": "Arrange", "items": self.arrange_items()},
@@ -711,6 +839,25 @@ class Desktop:
             return self.start_menu_items() if which == "start" else self.system_menu_items()
         if which == "switcher":
             return self.window_list_items() or [{"label": "(no windows)", "enabled": False}]
+        if which == "launcher":
+            return self.apps_menu_items()
+        if which == "appname":
+            top = self.windows[-1] if self.windows and not self.windows[-1].minimized else None
+            if top is None:
+                return [{"label": "About This Computer", "action": lambda: self.launch("about")},
+                        {"separator": True},
+                        {"label": "Preferences...", "action": lambda: self.launch("settings")}]
+            app_id, name = top.app.app_id, top.app.title
+            same = [w for w in self.windows if w.app.app_id == app_id] if app_id else [top]
+            return [{"label": f"About {name}", "action": lambda: self.launch("about")},
+                    {"separator": True},
+                    {"label": "Preferences...", "action": lambda: self.launch("settings")},
+                    {"separator": True},
+                    {"label": f"Hide {name}", "action": lambda: [self.minimize(w) for w in same]},
+                    {"label": "Hide Others", "action": lambda: [self.minimize(w) for w in list(self.windows)
+                                                                 if w not in same]},
+                    {"separator": True},
+                    {"label": f"Quit {name}", "shortcut": "Alt+F4", "action": lambda: [self.close(w) for w in same]}]
         if isinstance(which, tuple) and which[0] == "app" and self.windows:
             for title, items in self.app_menus(self.windows[-1]):
                 if title == which[1]:
@@ -794,9 +941,108 @@ class Desktop:
                 {"separator": True},
                 {"label": "Remove from Desktop", "action": lambda: self.pin_icon(e["id"], False)}]
 
+    def safe(self, app, method, *args):
+        """Call an app's input handler; a bug in an app is logged and shown, never fatal."""
+        try:
+            return getattr(app, method)(*args)
+        except Exception as e:
+            import traceback
+            self.app_log(app.app_id or type(app).__name__, f"{method} failed:\n" + traceback.format_exc(limit=6))
+            self.notify(f"{app.title}: {type(e).__name__}: {e}")
+            self.bus.publish("app.error", app_id=app.app_id, title=app.title, error=f"{method}: {type(e).__name__}: {e}")
+
+    # ----- per-app logs and storage (for agents building apps) -----
+    def app_log(self, app_id, line):
+        log = self.app_logs.setdefault(app_id, collections.deque(maxlen=500))
+        log.append((round(time.time(), 3), str(line)[:2000]))
+
+    def _storage_path(self, app_id):
+        import os
+        import re
+        from .settings import APPS_DIR
+        return os.path.join(APPS_DIR, "data", re.sub(r"[^A-Za-z0-9_.-]", "_", app_id) + ".json")
+
+    def app_storage(self, app_id):
+        import json
+        try:
+            with open(self._storage_path(app_id), encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {}
+
+    def save_app_storage(self, app_id, data):
+        import json
+        import os
+        path = self._storage_path(app_id)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(data, f, default=str)
+        os.replace(path + ".tmp", path)
+
+    # ----- Dock (themes that have one) -----
+    def dock_apps(self):
+        """[(entry, running windows topmost first)]: kept apps in order, then other running apps."""
+        out, seen = [], set()
+        for app_id in self.settings["dock"]:
+            e = self.registry.entries.get(app_id)
+            if e is not None and app_id not in seen:
+                seen.add(app_id)
+                out.append(e)
+        for w in reversed(self.windows):
+            app_id = w.app.app_id
+            e = self.registry.entries.get(app_id or "")
+            if e is not None and app_id not in seen and app_id != "dialog":
+                seen.add(app_id)
+                out.append(e)
+        return [(e, [w for w in reversed(self.windows) if w.app.app_id == e["id"]]) for e in out]
+
+    def keep_in_dock(self, app_id, on=True):
+        dock = [a for a in self.settings["dock"] if a != app_id]
+        if on:
+            dock.append(app_id)
+        self.settings.set("dock", dock)
+        self.dirty = True
+
+    def _dock_press(self, it, x, y, pressed):
+        top = self.theme.dock_zone(self)[1]
+        if it["kind"] == "window":
+            self.focus(it["win"])
+        elif it["kind"] == "launcher":
+            self.open_menu(self.apps_menu_items(), x, top - 2, source="dock", up=True)
+        elif it["kind"] == "app":
+            e, wins = it["entry"], it["windows"]
+            if pressed & 2:
+                kept = e["id"] in self.settings["dock"]
+                items = [{"label": w.title, "checked": w is self.windows[-1],
+                          "action": (lambda w=w: self.focus(w))} for w in wins]
+                items += [{"separator": True}] if wins else []
+                items += [{"label": "New Window" if wins else "Open", "action": lambda: self.launch(e["id"])},
+                          {"label": "Keep in Dock", "checked": kept,
+                           "action": lambda: self.keep_in_dock(e["id"], not kept)}]
+                if wins:
+                    items += [{"separator": True},
+                              {"label": "Quit", "action": lambda: [self.close(w) for w in list(wins)]}]
+                self.open_menu(items, x, top - 2, source="dock", up=True)
+            elif wins:
+                shown = [w for w in wins if not w.minimized]
+                self.focus(shown[0] if shown else wins[0])
+            else:
+                self.launch(e["id"])
+
     # ----- dialogs -----
+    def file_dialog(self, mode="open", callback=None, **kw):
+        """Open / save / folder chooser (filedialog.FileDialogApp); callback(path) on success."""
+        win = self.open(FileDialogApp, mode=mode, callback=callback, **kw)
+        ax, ay, aw, ah = self.work_area()
+        self.set_geometry(win, ax + (aw - win.w) // 2, ay + (ah - win.h) // 3, win.w, win.h)
+        win.on_top = True
+        win.app.app_id = "filedialog"
+        self.focus(win)
+        return win
+
     def dialog(self, **kw):
-        """Open an always-on-top dialog window (see dialogs.Dialog) centered in the work area."""
+        """Open an always-on-top dialog window (see dialogs.Dialog) centered in the work area.
+        on_result=fn(button, value) is called with the answer."""
         win = self.open(Dialog, **kw)
         ax, ay, aw, ah = self.work_area()
         self.set_geometry(win, ax + (aw - win.w) // 2, ay + (ah - win.h) // 3, win.w, win.h)
@@ -837,6 +1083,10 @@ class Desktop:
 
     # ----- input -----
     def on_key(self, k):
+        if self.grab is not None and k.down and (k.name == "ESCAPE" or k.alt or k.name in ("LGUI", "RGUI")):
+            self.release_pointer()
+            if k.name == "ESCAPE":
+                return
         if self.menus and k.down and self._menu_key(k):
             return
         if k.down and not k.name.startswith(("LCTRL", "RCTRL", "LALT", "RALT", "LSHIFT", "RSHIFT", "LGUI", "RGUI")):
@@ -858,8 +1108,8 @@ class Desktop:
         if k.down and k.ctrl and k.shift and k.name.lower() in ("c", "v") and self.windows:
             (self.copy_from if k.name.lower() == "c" else self.paste_into)(self.windows[-1])
             return
-        if self.windows and not self.windows[-1].shaded:
-            self.windows[-1].app.key(k)
+        if self.windows and not self.windows[-1].shaded and not self.windows[-1].minimized:
+            self.safe(self.windows[-1].app, "key", k)
             self.dirty = True
 
     def _menu_key(self, k):
@@ -920,9 +1170,19 @@ class Desktop:
         return bool(released)
 
     def on_mouse(self, m):
+        if self.grab is not None:
+            if self.grab in self.windows and not self.grab.minimized and self.windows[-1] is self.grab:
+                return self._grab_mouse(m)
+            self.release_pointer()
         x, y = m.x, m.y
         pressed, released = m.buttons & ~self.buttons, self.buttons & ~m.buttons
         self.mx, self.my, self.buttons = x, y, m.buttons
+        dz = self.theme.dock_zone(self)
+        if dz is not None:
+            over = _inside(dz, x, y) and not self.menus
+            if over or self.dock_hover:
+                self.dirty = True            # Dock magnification follows the pointer
+            self.dock_hover = over
 
         if self.menus and not self.drag and not self.resize and \
                 self._menu_mouse(x, y, pressed, released):
@@ -989,16 +1249,27 @@ class Desktop:
                 if not _inside(it["rect"], x, y):
                     continue
                 if it["kind"] == "task":
+                    win = it["win"]
                     if pressed & 2:
-                        self.open_menu(self.window_menu_items(it["win"]), x, y, source="window", up=True)
+                        self.open_menu(self.window_menu_items(win), x, y, source="window", up=True)
+                    elif win is self.windows[-1] and not win.minimized:
+                        self.minimize(win)
                     else:
-                        it["win"].shaded = False
-                        self.focus(it["win"])
+                        win.shaded = False
+                        self.focus(win)
                 elif it["kind"] in ("start", "menu"):
                     self.open_bar_menu(it)
                     self.menu_opened = time.monotonic()
                 self.dirty = True
                 return
+            return
+        dz = self.theme.dock_zone(self)
+        if dz is not None and _inside(dz, x, y):
+            for it in self.theme.dock_items(self):
+                if _inside(it["rect"], x, y):
+                    self._dock_press(it, x, y, pressed)
+                    break
+            self.dirty = True
             return
         for w in reversed(self.stack()):
             if not w.contains(x, y):
@@ -1012,17 +1283,17 @@ class Desktop:
                 self.close(w)
             elif pressed & 1 and _inside(boxes["zoom"], x, y):
                 self.maximize(w)
-            elif pressed & 1 and _inside(boxes["shade"], x, y):
+            elif pressed & 1 and "shade" in boxes and _inside(boxes["shade"], x, y):
                 self.shade(w)
+            elif pressed & 1 and "min" in boxes and _inside(boxes["min"], x, y):
+                self.minimize(w)
             elif pressed & 1 and self.theme.grip(w, x, y):
                 self.resize = (w, x, y, w.w, w.h)
             elif in_title or w.shaded:
                 if pressed & 1:
                     if self._double(w, x, y):
-                        if self.theme.shade_on_double_click:
-                            self.shade(w)
-                        else:
-                            self.maximize(w)
+                        {"shade": self.shade, "minimize": self.minimize}.get(
+                            self.theme.title_double_click, self.maximize)(w)
                     else:
                         self.drag = (w, x - w.x, y - w.y)
             else:
@@ -1031,7 +1302,7 @@ class Desktop:
                     items = w.app.context_menu(x - cx, y - cy)
                     if items:
                         self.open_menu(items, x, y, source="context",
-                                       on_pick=lambda it, app=w.app: app.on_menu(it.get("id")))
+                                       on_pick=lambda it, app=w.app: self.safe(app, "on_menu", it.get("id")))
                         return
                 self.capture = w
                 self._to_app(w, x, y, m.buttons, pressed, released, m.wheel)
@@ -1055,11 +1326,13 @@ class Desktop:
 
     def _to_app(self, w, x, y, buttons, pressed, released, wheel):
         cx, cy, _, _ = w.client()
-        w.app.mouse(x - cx, y - cy, buttons, pressed, released, wheel)
+        self.safe(w.app, "mouse", x - cx, y - cy, buttons, pressed, released, wheel)
         self.dirty = True
 
     def _accept_mouse(self, m):
         now = time.monotonic()
+        if m.rel:
+            return True
         if m.web:
             # Move the board's own cursor along so the VGA screen shows where the browser points.
             if (m.x, m.y) != (self.mx, self.my):
@@ -1086,7 +1359,7 @@ class Desktop:
         if self.wall is not None:
             bg.paste(self.wall, (ax + (aw - self.wall.width) // 2, ay + (ah - self.wall.height) // 2))
         elif st["pattern"]:
-            text_col = self.theme.background_pattern(bd, self.W, self.H, base, area)
+            text_col = self.theme.background_pattern(bd, self.W, self.H, base, area, img=bg)
         if st["caption"]:
             bd.text((ax + 10, ay + ah - 22), st["caption"], font=FONT, fill=text_col)
         return bg
@@ -1098,6 +1371,7 @@ class Desktop:
         d = ImageDraw.Draw(self.img)
         d.fontmode = "1"
         th = self.theme
+        th.mouse = (self.mx, self.my) if self.grab is None else (-1, -1)
 
         for e, x, y in self.icon_slots():
             th.draw_icon(d, x, y, e["title"], e.get("icon", "app"), e["id"] == self.icon_sel)
@@ -1116,6 +1390,11 @@ class Desktop:
                 try:
                     w.app.draw(sd, 0, 0, cw, ch)
                 except Exception as e:
+                    key = (w.id, str(e))
+                    if getattr(self, "_last_draw_error", None) != key:      # log each new error once
+                        import traceback
+                        self._last_draw_error = key
+                        self.app_log(w.app.app_id or type(w.app).__name__, "draw failed:\n" + traceback.format_exc(limit=6))
                     sd.rectangle([0, 0, cw, CH + 4], fill=C.white)
                     sd.text((4, 2), f"error: {e}"[: max(1, cw // CW)], font=FONT, fill=C.red)
                 self.img.paste(self.target, (x, y))
@@ -1123,6 +1402,8 @@ class Desktop:
 
         self.clock = self.clock_text()
         th.draw_bar(self, d, th.bar_items(self))
+        if th.dock_zone(self) is not None:
+            th.draw_dock(self, d, th.dock_items(self))
 
         for m in self.menus:
             th.draw_menu(d, m)
@@ -1161,15 +1442,34 @@ class Desktop:
         elif isinstance(ev, Key):
             self.on_key(ev)
         elif isinstance(ev, Mouse) and self._accept_mouse(ev):
+            if ev.rel and self.grab is None:      # pointer-lock motion with nothing capturing: move normally
+                ev = Mouse(max(0, min(self.W - 1, self.mx + ev.x)), max(0, min(self.H - 1, self.my + ev.y)),
+                           ev.buttons, ev.wheel, web=True)
+                self._accept_mouse(ev)
             if self.menus:
                 self.dirty = True       # hover highlight
             self.on_mouse(ev)
 
+    def _tick(self, w):
+        try:
+            if w.app.tick():
+                self.dirty = True
+        except Exception as e:      # a broken app must not take the desktop down
+            import traceback
+            w.app.tick = lambda: False
+            self.notify(f"{w.title}: {type(e).__name__}: {e}")
+            self.app_log(w.app.app_id or type(w.app).__name__, "tick crashed:\n" + traceback.format_exc(limit=6))
+            self.bus.publish("app.error", app_id=w.app.app_id, window_id=w.id, title=w.title,
+                             error=f"{type(e).__name__}: {e}")
+
     def run(self):
         last_tick = 0
+        fast = {}                  # window id -> next tick time, for apps with their own fps
         while True:
+            now = time.monotonic()
+            wait = min([0.05] + [max(0.0, t - now) for t in fast.values()])
             try:
-                ev = self.inbox.get(timeout=0.05)
+                ev = self.inbox.get(timeout=wait)
             except queue.Empty:
                 ev = False
             while ev is not False:
@@ -1178,11 +1478,23 @@ class Desktop:
                     ev = self.inbox.get_nowait()
                 except queue.Empty:
                     ev = False
-            if time.monotonic() - last_tick > 0.2:
-                last_tick = time.monotonic()
+            now = time.monotonic()
+            live = set()
+            for w in self.windows:
+                fps = getattr(w.app, "fps", 0)
+                if fps and not w.shaded and not w.minimized:
+                    live.add(w.id)
+                    if now >= fast.get(w.id, 0):
+                        nxt = fast.get(w.id, now) + 1.0 / fps
+                        fast[w.id] = nxt if nxt > now else now + 1.0 / fps    # fell behind: don't burst
+                        self._tick(w)
+            fast = {k: v for k, v in fast.items() if k in live}
+            self.palettes.update()
+            if now - last_tick > 0.2:
+                last_tick = now
                 for w in self.windows:
-                    if w.app.tick():
-                        self.dirty = True
+                    if not getattr(w.app, "fps", 0):
+                        self._tick(w)
                 if self.clock_text() != self.clock:
                     self.dirty = True
                 now = time.monotonic()

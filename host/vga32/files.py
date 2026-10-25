@@ -82,6 +82,8 @@ class Files(App):
             self.go(p)
         elif low.endswith(IMAGE_EXT):
             self.desk.launch("viewer", url=p)
+        elif low.endswith((".bsp", ".obj")):
+            self.desk.launch("viewer3d", path=p)
         elif low.endswith((".html", ".htm")):
             self.desk.launch("web", url="file:///" + p.replace("\\", "/").lstrip("/"))
         elif low.endswith(TEXT_EXT) or self.entries[i][2] < 256 * 1024:
@@ -194,7 +196,8 @@ class Files(App):
                 d.rectangle([x, ry, x + w - 1, ry + ROW_H - 1], fill=self.desk.theme.colors["select"])
             col = self.desk.theme.colors["select_text"] if sel else C.black
             low = name.lower()
-            glyph = "folder" if is_dir else "image" if low.endswith(IMAGE_EXT) else \
+            glyph = "folder" if is_dir else "image" if low.endswith(IMAGE_EXT) else "star" if low.endswith(
+                (".bsp", ".obj")) else \
                 "web" if low.endswith((".html", ".htm")) else "doc" if low.endswith(TEXT_EXT) else "file"
             draw_glyph(d, x + 4, ry + 1, glyph, ROW_H - 2)
             d.text((x + ROW_H + 8, ry + 1), name[: max(1, (w - 190) // 7)], font=FONT, fill=col)

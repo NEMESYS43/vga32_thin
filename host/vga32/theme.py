@@ -34,7 +34,7 @@ class Theme:
     title_h = 18
     bar_h = 24
     bar_top = False             # True: a menu bar across the top instead of a taskbar
-    shade_on_double_click = False
+    title_double_click = "maximize"     # maximize | shade | minimize
     item_h = 20                 # popup menu row height
     palette = list(PALETTE)
     desktop = {"background": "teal", "pattern": "dots"}
@@ -45,6 +45,7 @@ class Theme:
     def __init__(self):
         self.title_font = FONT
         self.menu_font = FONT
+        self.mouse = (-1, -1)       # pointer position, set by the desktop before each frame
 
     # ----- geometry -----
     def work_area(self, W, H):
@@ -180,7 +181,122 @@ class Theme:
         """None for the board's built-in arrow, or (rows of palette indices, hx, hy)."""
         return None
 
-    def background_pattern(self, bd, W, H, base, area):
+    # ----- Dock (only themes with one) -----
+    def dock_zone(self, desk):
+        """(x, y, w, h) the Dock owns, or None."""
+        return None
+
+    def dock_items(self, desk):
+        return []
+
+    def draw_dock(self, desk, d, items):
+        pass
+
+    # ----- widgets (widgets.py and panels draw through these, so they follow the theme) -----
+    def draw_button(self, d, r, label, pressed=False, default=False, enabled=True, focused=False):
+        x, y, w, h = r
+        bevel(d, x, y, w, h, raised=not pressed, face=self.colors["face"])
+        if default or focused:
+            d.rectangle([x - 1, y - 1, x + w, y + h], outline=C.black)
+        self._label(d, r, label, self.colors["text"] if enabled else self.colors["disabled"], pressed)
+
+    def _label(self, d, r, label, col, pressed=False, font=None):
+        x, y, w, h = r
+        font = font or self.menu_font
+        tw = int(font.getlength(label))
+        th = text_size("Mg", font)[1]
+        d.text((x + (w - tw) // 2 + pressed, y + (h - th) // 2 - 1 + pressed), label, font=font, fill=col)
+
+    def draw_check(self, d, x, y, on, radio=False, enabled=True):
+        """A 13x13 checkbox or radio button at (x, y)."""
+        bg = C.white if enabled else C.gray
+        if radio:
+            d.ellipse([x, y, x + 12, y + 12], fill=bg, outline=C.darkgray)
+            d.arc([x, y, x + 12, y + 12], 45, 225, fill=C.darkgray)
+            if on:
+                d.ellipse([x + 4, y + 4, x + 8, y + 8], fill=C.black)
+            return
+        bevel(d, x, y, 13, 13, raised=False, face=bg)
+        if on:
+            d.line([x + 3, y + 6, x + 5, y + 9, x + 10, y + 3], fill=C.black, width=2)
+
+    def draw_field(self, d, r, focused=False, enabled=True):
+        """A text field frame; returns the inner (x, y, w, h) to put text in."""
+        x, y, w, h = r
+        bevel(d, x, y, w, h, raised=False, face=C.white if enabled else C.gray)
+        return x + 3, y + 2, w - 6, h - 4
+
+    def draw_slider(self, d, r, frac, focused=False, enabled=True):
+        x, y, w, h = r
+        cy = y + h // 2
+        bevel(d, x, cy - 2, w, 4, raised=False, face=C.white)
+        kx = x + int((w - 10) * frac)
+        bevel(d, kx, y + 1, 10, h - 2, face=self.colors["face"])
+        if focused:
+            d.rectangle([kx + 2, y + 3, kx + 7, y + h - 4], outline=C.black)
+
+    def draw_progress(self, d, r, frac, phase=0):
+        x, y, w, h = r
+        bevel(d, x, y, w, h, raised=False, face=C.white)
+        fw = int((w - 4) * max(0.0, min(1.0, frac)))
+        for bx in range(x + 2, x + 2 + fw - 7, 9):     # Windows-style blocks
+            d.rectangle([bx, y + 2, bx + 6, y + h - 3], fill=self.colors["select"])
+
+    def draw_list(self, d, r):
+        x, y, w, h = r
+        bevel(d, x, y, w, h, raised=False, face=C.white)
+        return x + 2, y + 2, w - 4, h - 4
+
+    def draw_tab(self, d, r, label, active=False, focused=False):
+        x, y, w, h = r
+        if not active:
+            y, h = y + 2, h - 2
+        d.rectangle([x, y, x + w - 1, y + h + (1 if active else 0)], fill=self.colors["face"])
+        d.line([x, y + h, x, y + 2, x + 2, y, x + w - 3, y], fill=C.white)
+        d.line([x + w - 2, y + 1, x + w - 1, y + 2, x + w - 1, y + h], fill=C.black)
+        d.line([x + w - 2, y + 2, x + w - 2, y + h], fill=C.darkgray)
+        self._label(d, (x, y, w, h), label, self.colors["text"])
+        if focused:
+            d.rectangle([x + 4, y + 3, x + w - 5, y + h - 3], outline=C.darkgray)
+
+    def draw_tab_page(self, d, r):
+        x, y, w, h = r
+        bevel(d, x, y, w, h, face=self.colors["face"])
+
+    def draw_scrollbar(self, d, r, start, end):
+        """Vertical scrollbar; start / end are the visible fraction of the content (0..1)."""
+        x, y, w, h = r
+        d.rectangle([x, y, x + w - 1, y + h - 1], fill=C.white)
+        d.point([(px, py) for py in range(y, y + h) for px in range(x + py % 2, x + w, 2)], fill=C.gray)
+        if end - start >= 0.999:
+            return
+        ty = y + int(h * start)
+        th = max(10, int(h * (end - start)))
+        bevel(d, x, min(ty, y + h - th), w, th, face=self.colors["face"])
+
+    def draw_switch(self, d, r, on, enabled=True, focused=False):
+        x, y, w, h = r
+        bevel(d, x, y, w, h, raised=False, face=self.colors["select"] if on else C.white)
+        kx = x + w - h if on else x
+        bevel(d, kx, y, h, h, face=self.colors["face"])
+        if focused:
+            d.rectangle([x - 2, y - 2, x + w + 1, y + h + 1], outline=C.darkgray)
+
+    def draw_header(self, d, r, label):
+        x, y, w, h = r
+        bevel(d, x, y, w, h, face=self.colors["face"])
+        d.text((x + 4, y + (h - 14) // 2), label, font=self.menu_font, fill=self.colors["text"])
+
+    def draw_group(self, d, r, title=""):
+        x, y, w, h = r
+        d.rectangle([x, y + 6, x + w - 2, y + h - 2], outline=C.darkgray)
+        d.rectangle([x + 1, y + 7, x + w - 1, y + h - 1], outline=C.white)
+        if title:
+            tw = int(self.menu_font.getlength(title))
+            d.rectangle([x + 6, y, x + 12 + tw, y + 12], fill=self.colors["face"])
+            d.text((x + 9, y - 1), title, font=self.menu_font, fill=self.colors["text"])
+
+    def background_pattern(self, bd, W, H, base, area, img=None):
         x0, y0, aw, ah = area
         accent = C.cyan if base != C.cyan else C.teal
         for i in range(x0, x0 + aw, 8):
@@ -199,7 +315,7 @@ class Platinum(Theme):
     title_h = 19
     bar_h = 20
     bar_top = True
-    shade_on_double_click = True
+    title_double_click = "shade"
     item_h = 18
     # RGB222 has no #DDDDDD, so the platinum face is the 170 grey; sky becomes the lavender
     # highlight and teal a desktop blue-violet. Index 0 and 15 stay black and white for the cursor.
@@ -375,7 +491,29 @@ class Platinum(Theme):
         m = {".": 255, "X": 15, "#": 0}
         return [[m[c] for c in row] for row in art], 0, 0
 
-    def background_pattern(self, bd, W, H, base, area):
+    def draw_button(self, d, r, label, pressed=False, default=False, enabled=True, focused=False):
+        x, y, w, h = r
+        if default:
+            d.rounded_rectangle([x - 3, y - 3, x + w + 2, y + h + 2], radius=5, outline=C.black, width=2)
+        d.rounded_rectangle([x, y, x + w - 1, y + h - 1], radius=3, fill=C.darkgray if pressed else C.gray,
+                            outline=C.black)
+        if not pressed:
+            d.line([x + 2, y + h - 3, x + 2, y + 2, x + w - 3, y + 2], fill=C.white)
+            d.line([x + w - 2, y + 3, x + w - 2, y + h - 2, x + 3, y + h - 2], fill=C.darkgray)
+        self._label(d, r, label, (C.white if pressed else C.black) if enabled else C.darkgray, False)
+        if focused and not default:
+            d.rounded_rectangle([x - 2, y - 2, x + w + 1, y + h + 1], radius=4, outline=C.sky)
+
+    def draw_slider(self, d, r, frac, focused=False, enabled=True):
+        x, y, w, h = r
+        cy = y + h // 2
+        d.rectangle([x, cy - 2, x + w - 1, cy + 1], fill=C.darkgray, outline=C.black)
+        kx = x + int((w - 11) * frac)
+        d.polygon([(kx, y + 1), (kx + 10, y + 1), (kx + 10, y + h - 5), (kx + 5, y + h - 1), (kx, y + h - 5)],
+                  fill=C.sky if focused else C.gray, outline=C.black)
+        d.line([kx + 1, y + 2, kx + 9, y + 2], fill=C.white)
+
+    def background_pattern(self, bd, W, H, base, area, img=None):
         x0, y0, aw, ah = area
         accent = C.navy if base != C.navy else C.blue
         for j in range(y0, y0 + ah, 2):
@@ -385,6 +523,8 @@ class Platinum(Theme):
 
 
 THEMES = {"classic": Theme, "platinum": Platinum}
+from .theme_aqua import Aqua  # noqa: E402  (Aqua builds on the classes above)
+THEMES["aqua"] = Aqua
 _current = Theme()
 
 
