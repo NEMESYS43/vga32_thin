@@ -205,6 +205,42 @@ class Agent:
         except TimeoutError as e:
             raise ToolError("desktop did not respond in time") from e
 
+    @tool("batch", "Run several agent tools in one request. Each action is {\"tool\": name, \"args\": {...}}.\n"
+          "Actions run in order against the desktop. Use this to combine clippy moves, app commands, or window\n"
+          "actions without one HTTP round-trip per step.",
+          {"actions": {"type": "array", "items": {"type": "object",
+                         "properties": {"tool": STR, "args": {"type": "object"}},
+                         "required": ["tool"]}}}, ["actions"])
+    def batch(self, actions):
+        if not isinstance(actions, list):
+            raise ToolError("actions must be a list")
+        if not actions:
+            raise ToolError("actions must not be empty")
+        if len(actions) > 24:
+            raise ToolError("at most 24 actions per batch")
+        results = []
+        for index, item in enumerate(actions):
+            if not isinstance(item, dict):
+                raise ToolError(f"action {index} is not an object")
+            name = item.get("tool")
+            args = item.get("args", {})
+            if not isinstance(name, str) or not name:
+                raise ToolError(f"action {index} has no tool name")
+            if args is None:
+                args = {}
+            if not isinstance(args, dict):
+                raise ToolError(f"action {index} args must be an object")
+            if name == "batch":
+                raise ToolError("batch actions may not contain another batch")
+            try:
+                results.append({"index": index, "tool": name, "ok": True,
+                                "result": self.run(name, args)})
+            except ToolError as e:
+                results.append({"index": index, "tool": name, "ok": False,
+                                "error": str(e)})
+                break
+        return results
+
     def _wait(self, check, timeout, interval=0.15):
         end = time.monotonic() + timeout
         while True:
@@ -690,6 +726,39 @@ class Agent:
     def notify(self, text, seconds=4):
         self.on(lambda d: d.notify(text, seconds))
         return {"shown": text}
+
+    @tool("clippy_say", "Make the overlay Clippy character speak and change expression. Supports movement via x/y or region "
+          "(top-left, top-right, bottom-left, bottom-right, center, assistant, cursor). "
+          "Mood may be happy, neutral, thinking, sad, worried, alert, wink, excited.",
+          {"text": STR, "mood": STR, "x": INT, "y": INT, "region": STR, "visible": BOOL,
+           "animate": BOOL, "duration": NUM})
+    def clippy_say(self, text=None, mood=None, x=None, y=None, region=None, visible=None,
+                   animate=True, duration=0.55):
+        def do(d):
+            d.clippy.update(text=text, mood=mood, x=x, y=y, region=region, visible=visible,
+                            animate=animate, duration=duration)
+            return {"ok": True, "text": d.clippy.text, "mood": d.clippy.mood,
+                    "visible": d.clippy.visible, "x": d.clippy.sprite_x, "y": d.clippy.sprite_y,
+                    "nearest_region": d.clippy.state().get("nearest_region"),
+                    "regions": list(d.clippy.state()["regions"].keys())}
+        return self.on(do)
+
+    @tool("clippy_move", "Move Clippy on the screen/map. target is a named map region (top-left, top-right, "
+          "bottom-left, bottom-right, center, assistant, cursor) or provide x/y.",
+          {"target": STR, "x": INT, "y": INT, "duration": NUM})
+    def clippy_move(self, target=None, x=None, y=None, duration=0.55):
+        def do(d):
+            d.clippy.update(region=target if target else None, x=x, y=y, animate=True, duration=duration)
+            return {"ok": True, "mood": d.clippy.mood, "x": d.clippy.sprite_x, "y": d.clippy.sprite_y,
+                    "nearest_region": d.clippy.state().get("nearest_region")}
+        return self.on(do)
+
+    @tool("clippy_state", "Read Clippy's current text, mood, position, movement, and available map regions.",
+          {})
+    def clippy_state(self):
+        def do(d):
+            return d.clippy.state()
+        return self.on(do)
 
     @tool("desktop_style", "Change the look: theme (classic = taskbar + Start menu, platinum = Mac OS 9-style "
           "menu bar and pinstriped windows, aqua = Mac OS X-style menu bar, traffic-light windows and a Dock), "
