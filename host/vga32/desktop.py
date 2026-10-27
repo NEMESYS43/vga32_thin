@@ -47,6 +47,7 @@ from .ui import CH, CW, FONT, bevel, parse_color, text_size
 from .viewer import Viewer
 from .viewer3d import Viewer3D
 from .webview import WebView
+from .clippy import ClippyOverlay
 
 # id, class, registry fields
 BUILTINS = [
@@ -170,6 +171,7 @@ class Desktop:
         self.registry.load_dir()
         self.bus = EventBus(self._webhooks_for)
         self.palettes = PaletteManager(self)
+        self.clippy = ClippyOverlay(self)
         self.app_logs = {}         # app id -> deque of (time, line)
         self.inbox = queue.Queue()
         self.dev = NullDevice(w, h)
@@ -1083,6 +1085,19 @@ class Desktop:
 
     # ----- input -----
     def on_key(self, k):
+        # Manual Clippy repositioning even when the board mouse is off.
+        try:
+            c = getattr(self, "clippy", None)
+        except Exception:
+            c = None
+        if c is not None and c.visible and k.down and k.alt and not self.menus and k.name in ("LEFT", "RIGHT", "UP", "DOWN"):
+            step = 32 if k.ctrl else 16
+            dx = (-step if k.name == "LEFT" else step if k.name == "RIGHT" else 0)
+            dy = (-step if k.name == "UP" else step if k.name == "DOWN" else 0)
+            c.move_to(c.sprite_x + dx, c.sprite_y + dy)
+            c.say("Moving out of the way.", mood="happy", ttl=1800)
+            self.dirty = True
+            return
         if self.grab is not None and k.down and (k.name == "ESCAPE" or k.alt or k.name in ("LGUI", "RGUI")):
             self.release_pointer()
             if k.name == "ESCAPE":
@@ -1222,6 +1237,27 @@ class Desktop:
             if not m.buttons:
                 self.capture = None
             return
+
+        # Allow direct mouse interaction with the Clippy overlay (drag, bring to front).
+        try:
+            if getattr(self, "clippy", None) is not None and self.clippy.visible:
+                if self.clippy.dragging:
+                    if m.buttons & 1:
+                        self.clippy.sprite_x = x - self.clippy._drag_dx
+                        self.clippy.sprite_y = y - self.clippy._drag_dy
+                        self.clippy._last_interact = time.monotonic()
+                        self.clippy.desk.dirty = True
+                        return
+                    self.clippy.dragging = False
+                    self.clippy.mood = "happy"
+                elif self.clippy.hit(x, y) and (pressed & 1):
+                    self.clippy.dragging = True
+                    self.clippy._drag_dx = x - self.clippy.sprite_x
+                    self.clippy._drag_dy = y - self.clippy.sprite_y
+                    self.clippy.update(mood="excited", text="I can be dragged anywhere on the screen")
+                    return
+        except Exception:
+            pass
 
         if pressed:
             self._press(x, y, m, pressed, released)
@@ -1416,6 +1452,9 @@ class Desktop:
             d.text((tx + 8, ty + 4), text[:max(1, (tw - 16) // CW)], font=FONT, fill=C.black)
             ty += CH + 12
 
+        if getattr(self, "clippy", None) is not None:
+            self.clippy.draw(d)
+
     def frame(self):
         """Render and push a frame now if anything changed."""
         if self.dirty:
@@ -1501,6 +1540,12 @@ class Desktop:
                 if any(t < now for _, t in self.toasts):
                     self.toasts = [(s, t) for s, t in self.toasts if t >= now]
                     self.dirty = True
+                if getattr(self, "clippy", None) is not None:
+                    try:
+                        if self.clippy.tick():
+                            self.dirty = True
+                    except Exception:
+                        pass
             try:
                 self.frame()
             except Exception as e:     # a board dropping mid-frame shouldn't kill the desktop
