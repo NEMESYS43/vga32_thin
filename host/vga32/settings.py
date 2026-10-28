@@ -36,6 +36,7 @@ DEFAULTS = {
     # {"name": "hermes", "token": "...", "scopes": ["ui", "input", "terminal", "web", "admin"]}
     "tokens": [],
     "webhooks": [],                     # URLs that receive every desktop event as JSON (POST)
+    "boards": [],                       # saved ESP32 VGA board hosts ("ip" or "ip:port") for multi-device management
 }
 
 

@@ -255,7 +255,33 @@ class Agent:
     def get_state(self):
         return self.on(lambda d: d.state())
 
+    @tool("list_boards", "List discovered/remembered ESP32 VGA devices and the active board. "
+          "Each record includes host, name, resolution, connection state and whether it is active.")
+    def list_boards(self):
+        return self.on(lambda d: d.list_boards())
+
+    @tool("discover_boards", "Scan the LAN for ESP32 VGA beacons (UDP 7778) and remember every board found.",
+          {"timeout": {"type": "number", "description": "seconds to listen, default 2"}})
+    def discover_boards(self, timeout=2.0):
+        return self.on(lambda d: d.discover_boards(timeout=timeout))
+
+    @tool("connect_board", "Connect to (or switch the active desktop display to) an ESP32 VGA device "
+          "given its host or host:port. Replaces the currently attached board.",
+          {"host": STR, "key": STR, "port": INT, "timeout": NUM}, ["host"])
+    def connect_board(self, host, key=None, port=None, timeout=5.0):
+        return self.on(lambda d: d.connect_board(host=host, key=key, port=port, timeout=timeout))
+
+    @tool("disconnect_board", "Detach the active ESP32 VGA board (the desktop keeps running into NullDevice).")
+    def disconnect_board(self):
+        return self.on(lambda d: d.disconnect_board())
+
+    @tool("forget_board", "Remove a remembered board from multi-device management. Does not disconnect the active board.",
+          {"host": STR}, ["host"])
+    def forget_board(self, host):
+        return self.on(lambda d: d.forget_board(host))
+
     @tool("screenshot", "PNG of exactly what the VGA monitor shows (the board's cursor is not included). "
+
           "Optionally crop to one window and upscale for easier reading.",
           {"window_id": INT, "scale": {"type": "integer", "minimum": 1, "maximum": 3,
                                        "description": "pixel upscale factor, default 1"}})

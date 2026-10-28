@@ -175,6 +175,14 @@ class Desktop:
         self.app_logs = {}         # app id -> deque of (time, line)
         self.inbox = queue.Queue()
         self.dev = NullDevice(w, h)
+        self.boards = {}          # host/ip -> metadata for every known ESP32 VGA device
+        self.active_board_id = None
+        for host in self.settings.get("boards", []) or []:
+            if isinstance(host, str) and host.strip():
+                self.boards.setdefault(host.strip(), {
+                    "id": host.strip(), "host": host.strip(), "port": 7777,
+                    "name": "(saved)", "connected": False,
+                    "width": None, "height": None, "last_seen": None})
         self.screen = Screen(self.dev)
         self.img = Image.new("RGB", (w, h))
         self.bg = None
@@ -211,6 +219,24 @@ class Desktop:
 
     def attach(self, dev):
         was = self.connected
+        if not isinstance(dev, NullDevice):
+            self.boards.setdefault(dev.host, {
+                "id": dev.host, "host": dev.host, "port": 7777,
+                "name": dev.info.name, "connected": True,
+                "width": dev.info.width, "height": dev.info.height,
+                "proto": dev.info.proto, "keyboard": dev.info.keyboard,
+                "mouse": dev.info.mouse, "last_seen": time.time()})
+            meta = self.boards[dev.host]
+            meta.update({"name": dev.info.name, "connected": True,
+                         "width": dev.info.width, "height": dev.info.height,
+                         "proto": dev.info.proto, "keyboard": dev.info.keyboard,
+                         "mouse": dev.info.mouse, "last_seen": time.time()})
+            self.active_board_id = dev.host
+            try:
+                saved = [h for h in (self.settings.get("boards", []) or []) if h != dev.host] + [dev.host]
+                self.settings.set("boards", saved, save=True)
+            except Exception:
+                pass
         self.dev = dev
         w, h = dev.info.width, dev.info.height
         if (w, h) != (self.W, self.H):
@@ -230,7 +256,75 @@ class Desktop:
             self.bus.publish("board.detached")
 
     def detach(self):
+        if not isinstance(self.dev, NullDevice) and self.dev.host in self.boards:
+            self.boards[self.dev.host]["connected"] = False
+            self.boards[self.dev.host]["last_seen"] = time.time()
+        self.active_board_id = None
         self.attach(NullDevice(self.W, self.H))
+
+    # ----- multi-device board management -----
+    def list_boards(self):
+        out = []
+        for host, meta in sorted(self.boards.items()):
+            m = dict(meta)
+            m["active"] = host == self.active_board_id
+            m["connected"] = bool(m.get("connected")) and (host == self.active_board_id if self.connected else False)
+            out.append(m)
+        return out
+
+    def discover_boards(self, timeout=2.0):
+        from .client import discover
+        for ip, f in discover(timeout=timeout):
+            info = {"id": ip, "host": ip, "port": 7777,
+                    "name": f.get("name", "(board)") or "(board)",
+                    "connected": ip == self.active_board_id,
+                    "width": int(f.get("w", 0) or 0) or None,
+                    "height": int(f.get("h", 0) or 0) or None,
+                    "proto": f.get("proto"), "busy": f.get("busy"),
+                    "last_seen": time.time()}
+            self.boards[ip] = {**self.boards.get(ip, {}), **info}
+        saved = sorted(set(self.boards) | set(self.settings.get("boards", []) or []))
+        self.settings.set("boards", saved, save=True)
+        return self.list_boards()
+
+    def connect_board(self, host, key=None, port=None, timeout=5.0):
+        host = str(host).strip()
+        if not host:
+            raise ValueError("host is required")
+        parsed = host
+        if ":" in host and not host.startswith("["):
+            maybe_host, maybe_port = host.rsplit(":", 1)
+            if maybe_port.isdigit():
+                parsed, port = maybe_host, int(maybe_port)
+        p = int(port) if port is not None else 7777
+        from .client import Device
+        dev = Device(parsed, port=p, key=key or "12345678", timeout=timeout, events=self.inbox)
+        self.attach(dev)
+        info = dev.info
+        return {"connected": True, "active_board_id": self.active_board_id,
+                "board": {"name": info.name, "host": dev.host,
+                          "width": info.width, "height": info.height,
+                          "proto": info.proto, "keyboard": info.keyboard,
+                          "mouse": info.mouse}}
+
+    def disconnect_board(self):
+        if self.connected:
+            self.detach()
+        return {"connected": False, "active_board_id": None,
+                "board": None}
+
+    def forget_board(self, host):
+        host = str(host).strip()
+        if host and self.connected and host == self.active_board_id:
+            raise ValueError("disconnect the active board before forgetting it")
+        if host in self.boards and not (self.connected and host == self.active_board_id):
+            self.boards.pop(host, None)
+        saved = [h for h in (self.settings.get("boards", []) or []) if h != host]
+        self.settings.set("boards", saved, save=True)
+        return {"forgotten": host, "boards": self.list_boards()}
+
+    def select_board(self, host, key=None, port=None, timeout=5.0):
+        return self.connect_board(host, key=key, port=port, timeout=timeout)
 
     def _apply_device(self):
         """Send the current palette (the theme's, or an adaptive one) and the cursor to the board."""
@@ -1062,6 +1156,8 @@ class Desktop:
                                    else "bottom"}, "title_h": self.theme.title_h},
                 "theme": self.theme.name,
                 "board": {"connected": self.connected, "name": self.dev.info.name, "host": self.dev.host,
+                          "managed_boards": list(self.list_boards()),
+                          "active_board_id": self.active_board_id,
                           "frames_sent": self.frames, "bytes_sent": self.screen.bytes_sent},
                 "mouse": {"x": self.mx, "y": self.my, "buttons": self.buttons},
                 "menus": [m.public() for m in self.menus],

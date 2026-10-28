@@ -446,6 +446,14 @@ class System(App):
                 f"Python {platform.python_version()}",
                 f"Board  {dev.info.name} @ {dev.host}  {self.desk.W}x{self.desk.H}",
                 f"Sent   {self.desk.screen.bytes_sent // 1024} KB"]
+        boards = self.desk.list_boards()
+        # show multi-board management summary (active + known devices)
+        if boards:
+            active = self.desk.active_board_id or "(none)"
+            info.append(f"Boards {len(boards)} active={active}")
+            for b in boards[:4]:
+                mark = "*" if b.get("active") else " "
+                info.append(f" {mark} {b.get('name', '?')} @ {b.get('host', '?')}")
         if not self.ps:
             info.append("pip install psutil for CPU / RAM")
         for i, s in enumerate(info):
